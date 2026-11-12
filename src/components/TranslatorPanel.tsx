@@ -62,13 +62,22 @@ export function TranslatorPanel({
           {entries.map((entry) => (
             <li
               key={entry.id}
+              aria-label={
+                entry.type === 'confidence.result'
+                  ? 'Sello de Confianza'
+                  : 'Traducción contextual'
+              }
               className="grid gap-3 border-b border-slate-100 pb-4 last:border-0 last:pb-0 md:grid-cols-[1fr_auto_1fr]"
             >
               <article aria-label={`Original en ${languageName(entry.sourceLanguage)}`}>
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  {languageName(entry.sourceLanguage)}
+                  {entry.type === 'confidence.result'
+                    ? 'Presentación'
+                    : languageName(entry.sourceLanguage)}
                 </p>
-                <p className="mt-1 text-sm leading-6 text-slate-900">{entry.sourceText}</p>
+                <p className="mt-1 text-sm leading-6 text-slate-900">
+                  {entry.originalText || 'No se detectó una frase de audio.'}
+                </p>
               </article>
               <ArrowRight
                 aria-hidden="true"
@@ -83,8 +92,36 @@ export function TranslatorPanel({
                   {languageName(entry.targetLanguage)}
                 </p>
                 <p className="mt-1 text-sm leading-6 text-slate-900">
-                  {entry.translatedText}
+                  {entry.translatedText || entry.errorMessage || 'Sin traducción disponible.'}
                 </p>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <span
+                    className={`text-xs font-medium ${
+                      entry.status === 'error'
+                        ? 'text-rose-700'
+                        : entry.status === 'sandbox'
+                          ? 'text-amber-700'
+                          : 'text-emerald-700'
+                    }`}
+                  >
+                    {entry.status === 'error'
+                      ? 'Error'
+                      : entry.status === 'sandbox'
+                        ? 'Sandbox'
+                        : 'Traducido'}
+                  </span>
+                  {entry.audioBase64 && entry.audioMimeType && (
+                    <audio
+                      controls
+                      preload="none"
+                      aria-label="Reproducir audio traducido"
+                      className="h-9 max-w-full"
+                      src={`data:${entry.audioMimeType};base64,${entry.audioBase64}`}
+                    >
+                      El navegador no puede reproducir este audio.
+                    </audio>
+                  )}
+                </div>
               </article>
             </li>
           ))}

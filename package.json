@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "start:server": "tsx src/server/index.ts",
-    "test": "tsx --test src/server/index.test.ts",
+    "start:server": "tsx server/index.ts",
+    "test": "tsx --test src/server/index.test.ts server/services/contextManager.test.ts server/services/aiPipeline.test.ts server/index.test.ts",
     "dev:client": "vite",
     "build:client": "vite build"
   },
   "dependencies": {
+    "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",

@@ -7,21 +7,27 @@ export type AudioConnectionStatus =
 export type AudioLanguage = 'es' | 'en';
 
 export interface TranscriptEvent {
-  type: 'transcript';
+  type: 'translation.result' | 'confidence.result';
   id: string;
   sourceLanguage: AudioLanguage;
   targetLanguage: AudioLanguage;
-  sourceText: string;
+  originalText: string;
   translatedText: string;
+  audioBase64: string | null;
+  audioMimeType: string | null;
+  status: 'ok' | 'sandbox' | 'error';
   timestamp: string;
+  errorCode?: string;
+  errorMessage?: string;
 }
 
 export type AudioServerEvent =
-  | { type: 'connection.ready'; pipeline: Record<string, string> }
   | {
       type: 'session.started';
+      sessionId: string;
       sourceLanguage: AudioLanguage;
       targetLanguage: AudioLanguage;
+      pipeline: Record<string, string>;
     }
   | { type: 'session.stopped' }
   | { type: 'audio.received'; bytes: number; pipeline: string }
@@ -31,6 +37,7 @@ export type AudioServerEvent =
 export interface AudioStreamOptions {
   sourceLanguage: AudioLanguage;
   targetLanguage: AudioLanguage;
+  sessionId?: string;
   onEvent?: (event: AudioServerEvent) => void;
   onStatusChange?: (status: AudioConnectionStatus) => void;
   onError?: (error: Error) => void;
@@ -50,26 +57,25 @@ function parseServerEvent(value: unknown): AudioServerEvent | null {
   }
 
   switch (value.type) {
-    case 'connection.ready':
-      if (!isRecord(value.pipeline)) {
+    case 'session.started':
+      if (
+        typeof value.sessionId !== 'string' ||
+        !isLanguage(value.sourceLanguage) ||
+        !isLanguage(value.targetLanguage) ||
+        !isRecord(value.pipeline)
+      ) {
         return null;
       }
       return {
-        type: 'connection.ready',
+        type: 'session.started',
+        sessionId: value.sessionId,
+        sourceLanguage: value.sourceLanguage,
+        targetLanguage: value.targetLanguage,
         pipeline: Object.fromEntries(
           Object.entries(value.pipeline).filter(
             (entry): entry is [string, string] => typeof entry[1] === 'string',
           ),
         ),
-      };
-    case 'session.started':
-      if (!isLanguage(value.sourceLanguage) || !isLanguage(value.targetLanguage)) {
-        return null;
-      }
-      return {
-        type: 'session.started',
-        sourceLanguage: value.sourceLanguage,
-        targetLanguage: value.targetLanguage,
       };
     case 'session.stopped':
       return { type: 'session.stopped' };
@@ -82,25 +88,40 @@ function parseServerEvent(value: unknown): AudioServerEvent | null {
         bytes: value.bytes,
         pipeline: value.pipeline,
       };
-    case 'transcript':
+    case 'translation.result':
+    case 'confidence.result':
       if (
         typeof value.id !== 'string' ||
         !isLanguage(value.sourceLanguage) ||
         !isLanguage(value.targetLanguage) ||
-        typeof value.sourceText !== 'string' ||
+        typeof value.originalText !== 'string' ||
         typeof value.translatedText !== 'string' ||
-        typeof value.timestamp !== 'string'
+        (typeof value.audioBase64 !== 'string' && value.audioBase64 !== null) ||
+        (typeof value.audioMimeType !== 'string' && value.audioMimeType !== null) ||
+        (value.status !== 'ok' && value.status !== 'sandbox' && value.status !== 'error') ||
+        typeof value.timestamp !== 'string' ||
+        (value.errorCode !== undefined && typeof value.errorCode !== 'string') ||
+        (value.errorMessage !== undefined && typeof value.errorMessage !== 'string')
       ) {
         return null;
       }
       return {
-        type: 'transcript',
+        type: value.type,
         id: value.id,
         sourceLanguage: value.sourceLanguage,
         targetLanguage: value.targetLanguage,
-        sourceText: value.sourceText,
+        originalText: value.originalText,
         translatedText: value.translatedText,
+        audioBase64: value.audioBase64,
+        audioMimeType: value.audioMimeType,
+        status: value.status,
         timestamp: value.timestamp,
+        ...(typeof value.errorCode === 'string'
+          ? { errorCode: value.errorCode }
+          : {}),
+        ...(typeof value.errorMessage === 'string'
+          ? { errorMessage: value.errorMessage }
+          : {}),
       };
     case 'error':
       if (typeof value.code !== 'string' || typeof value.message !== 'string') {
@@ -181,19 +202,20 @@ export class AudioStreamService {
       if (connectionAttempt !== this.connectionAttempt) {
         return;
       }
-      socket.send(
-        JSON.stringify({
-          type: 'session.start',
-          sourceLanguage: options.sourceLanguage,
-          targetLanguage: options.targetLanguage,
-        }),
-      );
-
       const recorder = new MediaRecorder(this.mediaStream);
       this.recorder = recorder;
       recorder.addEventListener('dataavailable', this.handleAudioData);
       recorder.addEventListener('error', this.handleRecorderError);
-      recorder.start(250);
+      socket.send(
+        JSON.stringify({
+          type: 'session.start',
+          sessionId: options.sessionId,
+          sourceLanguage: options.sourceLanguage,
+          targetLanguage: options.targetLanguage,
+          audioMimeType: recorder.mimeType || 'audio/webm',
+        }),
+      );
+      recorder.start(1_000);
       this.setStatus('connected');
     } catch (error: unknown) {
       const connectionError =
@@ -246,6 +268,13 @@ export class AudioStreamService {
       this.socket = null;
     }
     this.setStatus('disconnected');
+  }
+
+  sendConfidenceSeal(): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      throw new Error('Connect audio before requesting a confidence seal.');
+    }
+    this.socket.send(JSON.stringify({ type: 'confidence.seal' }));
   }
 
   private readonly handleMessage = (message: MessageEvent<unknown>): void => {
