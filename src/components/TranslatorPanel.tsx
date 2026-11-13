@@ -1,10 +1,14 @@
-import type { ReactElement } from 'react';
+import { useEffect, useRef, type ReactElement } from 'react';
 import { ArrowDown, ArrowRight, Languages } from 'lucide-react';
+import { setAudioOutputDevice } from '../services/audioDeviceService.js';
 import type { TranscriptEvent } from '../services/audioStreamService.js';
 
 interface TranslatorPanelProps {
   entries: TranscriptEvent[];
   isConnected: boolean;
+  outputDeviceId: string;
+  supportsOutputRouting: boolean;
+  onOutputError: (message: string) => void;
 }
 
 function languageName(language: TranscriptEvent['sourceLanguage']): string {
@@ -14,9 +18,43 @@ function languageName(language: TranscriptEvent['sourceLanguage']): string {
 export function TranslatorPanel({
   entries,
   isConnected,
+  outputDeviceId,
+  supportsOutputRouting,
+  onOutputError,
 }: TranslatorPanelProps): ReactElement {
+  const panelRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!supportsOutputRouting) {
+      return;
+    }
+
+    let isCurrent = true;
+    let hasReportedError = false;
+    const audioElements = panelRef.current?.querySelectorAll('audio');
+    audioElements?.forEach((audioElement) => {
+      void setAudioOutputDevice(audioElement, outputDeviceId).catch(
+        (error: unknown) => {
+          if (isCurrent && !hasReportedError) {
+            hasReportedError = true;
+            onOutputError(
+              error instanceof Error
+                ? error.message
+                : 'No se pudo enrutar el audio a la salida seleccionada.',
+            );
+          }
+        },
+      );
+    });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [entries, onOutputError, outputDeviceId, supportsOutputRouting]);
+
   return (
     <section
+      ref={panelRef}
       aria-labelledby="translator-heading"
       className="rounded-lg border border-slate-200 bg-white"
     >

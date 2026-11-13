@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "start:server": "tsx server/index.ts",
-    "test": "tsx --test src/server/index.test.ts server/services/contextManager.test.ts server/services/aiPipeline.test.ts server/index.test.ts",
+    "test": "tsx --test src/server/index.test.ts server/services/contextManager.test.ts server/services/aiPipeline.test.ts server/index.test.ts src/services/audioStreamService.test.ts src/services/audioDeviceService.test.ts",
     "dev:client": "vite",
     "build:client": "vite build"
   },

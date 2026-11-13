@@ -12,6 +12,11 @@ import {
   fetchLearningSummary,
   type LearningSummary,
 } from './services/learningSummaryService.js';
+import {
+  enumerateAudioDevices,
+  requestAudioOutputDevice,
+  type AudioDeviceCatalog,
+} from './services/audioDeviceService.js';
 
 function getAudioWebSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -41,6 +46,17 @@ export default function App(): React.JSX.Element {
     ReadonlySet<string>
   >(() => new Set());
   const learningSummaryRequestId = useRef(0);
+  const [audioDevices, setAudioDevices] = useState<AudioDeviceCatalog>({
+    inputs: [],
+    outputs: [],
+    supportsOutputRouting: false,
+    supportsOutputPermissionPrompt: false,
+  });
+  const [inputDeviceId, setInputDeviceId] = useState('');
+  const [outputDeviceId, setOutputDeviceId] = useState('');
+  const [audioDeviceError, setAudioDeviceError] = useState<string | null>(null);
+  const [isLoadingAudioDevices, setIsLoadingAudioDevices] = useState(true);
+  const [audioDeviceRefreshKey, setAudioDeviceRefreshKey] = useState(0);
 
   useEffect(
     () => () => {
@@ -49,6 +65,67 @@ export default function App(): React.JSX.Element {
     },
     [audioService],
   );
+
+  useEffect(() => {
+    let isCurrent = true;
+    setIsLoadingAudioDevices(true);
+
+    void enumerateAudioDevices()
+      .then((catalog) => {
+        if (!isCurrent) {
+          return;
+        }
+        setAudioDevices(catalog);
+        setInputDeviceId((current) =>
+          current && catalog.inputs.some((device) => device.deviceId === current)
+            ? current
+            : '',
+        );
+        setOutputDeviceId((current) =>
+          current && catalog.outputs.some((device) => device.deviceId === current)
+            ? current
+            : '',
+        );
+        setAudioDeviceError(null);
+      })
+      .catch((error: unknown) => {
+        if (isCurrent) {
+          setAudioDeviceError(
+            error instanceof Error
+              ? error.message
+              : 'No se pudieron enumerar los dispositivos de audio.',
+          );
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsLoadingAudioDevices(false);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [audioDeviceRefreshKey]);
+
+  function refreshAudioDevices(): void {
+    setAudioDeviceRefreshKey((current) => current + 1);
+  }
+
+  async function chooseAudioOutput(): Promise<void> {
+    setAudioDeviceError(null);
+    try {
+      const selectedDevice = await requestAudioOutputDevice();
+      setOutputDeviceId(selectedDevice.deviceId);
+      refreshAudioDevices();
+    } catch (error: unknown) {
+      setAudioDeviceError(
+        error instanceof Error
+          ? error.message
+          : 'No se pudo seleccionar la salida de audio.',
+      );
+    }
+  }
 
   async function toggleAudio(): Promise<void> {
     setConnectionError(null);
@@ -63,6 +140,7 @@ export default function App(): React.JSX.Element {
         sessionId,
         sourceLanguage,
         targetLanguage,
+        ...(inputDeviceId ? { inputDeviceId } : {}),
         onStatusChange: setStatus,
         onError: (error) => setConnectionError(error.message),
         onEvent: (event) => {
@@ -89,10 +167,12 @@ export default function App(): React.JSX.Element {
           }
         },
       });
+      refreshAudioDevices();
     } catch (error: unknown) {
       setConnectionError(
         error instanceof Error ? error.message : 'No se pudo iniciar el audio.',
       );
+      refreshAudioDevices();
     }
   }
 
@@ -203,10 +283,22 @@ export default function App(): React.JSX.Element {
           }}
           onSaveContext={saveContext}
           onGenerateConfidenceSeal={generateConfidenceSeal}
+          audioDevices={audioDevices}
+          inputDeviceId={inputDeviceId}
+          outputDeviceId={outputDeviceId}
+          audioDeviceError={audioDeviceError}
+          isLoadingAudioDevices={isLoadingAudioDevices}
+          onInputDeviceChange={setInputDeviceId}
+          onOutputDeviceChange={setOutputDeviceId}
+          onRefreshAudioDevices={refreshAudioDevices}
+          onChooseAudioOutput={() => void chooseAudioOutput()}
         />
         <TranslatorPanel
           entries={transcripts}
           isConnected={status === 'connected'}
+          outputDeviceId={outputDeviceId}
+          supportsOutputRouting={audioDevices.supportsOutputRouting}
+          onOutputError={setAudioDeviceError}
         />
         <LearningModule
           learningSummary={learningSummary}

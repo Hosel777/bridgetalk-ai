@@ -38,9 +38,37 @@ export interface AudioStreamOptions {
   sourceLanguage: AudioLanguage;
   targetLanguage: AudioLanguage;
   sessionId?: string;
+  inputDeviceId?: string;
   onEvent?: (event: AudioServerEvent) => void;
   onStatusChange?: (status: AudioConnectionStatus) => void;
   onError?: (error: Error) => void;
+}
+
+export const VOICE_ACTIVITY_RMS_THRESHOLD = 0.025;
+
+export function shouldSendAudioChunk(
+  hasData: boolean,
+  voiceDetected: boolean,
+): boolean {
+  return hasData && voiceDetected;
+}
+
+export function hasVoiceActivity(
+  samples: ArrayLike<number>,
+  threshold = VOICE_ACTIVITY_RMS_THRESHOLD,
+): boolean {
+  if (samples.length === 0) {
+    return false;
+  }
+
+  let squaredAmplitudeTotal = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    const amplitude = ((samples[index] ?? 128) - 128) / 128;
+    squaredAmplitudeTotal += amplitude * amplitude;
+  }
+
+  const rootMeanSquare = Math.sqrt(squaredAmplitudeTotal / samples.length);
+  return rootMeanSquare >= threshold;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -141,6 +169,11 @@ export class AudioStreamService {
   private socket: WebSocket | null = null;
   private mediaStream: MediaStream | null = null;
   private recorder: MediaRecorder | null = null;
+  private vadAudioContext: AudioContext | null = null;
+  private vadAnalyser: AnalyserNode | null = null;
+  private vadSourceNode: MediaStreamAudioSourceNode | null = null;
+  private vadSamplingInterval: number | null = null;
+  private voiceDetectedSinceLastChunk = false;
   private options: AudioStreamOptions | null = null;
   private closing = false;
   private connectionAttempt = 0;
@@ -175,12 +208,29 @@ export class AudioStreamService {
     this.setStatus('connecting');
 
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (typeof AudioContext === 'undefined') {
+        throw new Error('This browser does not support voice activity detection.');
+      }
+
+      const audioContext = new AudioContext();
+      this.vadAudioContext = audioContext;
+      await audioContext.resume();
+      if (connectionAttempt !== this.connectionAttempt) {
+        return;
+      }
+
+      const audioConstraints: MediaTrackConstraints = options.inputDeviceId
+        ? { deviceId: { exact: options.inputDeviceId } }
+        : {};
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
+      });
       if (connectionAttempt !== this.connectionAttempt) {
         mediaStream.getTracks().forEach((track) => track.stop());
         return;
       }
       this.mediaStream = mediaStream;
+      this.startVoiceActivityDetection(mediaStream);
 
       const socket = new WebSocket(parsedUrl.toString());
       socket.binaryType = 'arraybuffer';
@@ -303,8 +353,15 @@ export class AudioStreamService {
   };
 
   private readonly handleAudioData = (event: BlobEvent): void => {
+    const hasData = event.data.size > 0;
+    if (!hasData) {
+      return;
+    }
+
+    const voiceWasDetected = this.voiceDetectedSinceLastChunk;
+    this.voiceDetectedSinceLastChunk = false;
     if (
-      event.data.size > 0 &&
+      shouldSendAudioChunk(hasData, voiceWasDetected) &&
       this.socket?.readyState === WebSocket.OPEN
     ) {
       this.socket.send(event.data);
@@ -330,11 +387,57 @@ export class AudioStreamService {
   private releaseMedia(): void {
     this.mediaStream?.getTracks().forEach((track) => track.stop());
     this.mediaStream = null;
+    if (this.vadSamplingInterval !== null) {
+      window.clearInterval(this.vadSamplingInterval);
+      this.vadSamplingInterval = null;
+    }
+    this.vadSourceNode?.disconnect();
+    this.vadSourceNode = null;
+    this.vadAnalyser = null;
+    this.voiceDetectedSinceLastChunk = false;
+    const audioContext = this.vadAudioContext;
+    this.vadAudioContext = null;
+    if (audioContext && audioContext.state !== 'closed') {
+      void audioContext.close().catch((error: unknown) => {
+        this.options?.onError?.(
+          error instanceof Error
+            ? error
+            : new Error('Could not close the voice activity detector.'),
+        );
+      });
+    }
     if (this.recorder) {
       this.recorder.removeEventListener('dataavailable', this.handleAudioData);
       this.recorder.removeEventListener('error', this.handleRecorderError);
     }
     this.recorder = null;
+  }
+
+  private startVoiceActivityDetection(mediaStream: MediaStream): void {
+    const audioContext = this.vadAudioContext;
+    if (!audioContext) {
+      throw new Error('Voice activity detection is not initialized.');
+    }
+
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    sourceNode.connect(analyser);
+
+    this.vadAnalyser = analyser;
+    this.vadSourceNode = sourceNode;
+    const samples = new Uint8Array(analyser.fftSize);
+    this.vadSamplingInterval = window.setInterval(() => {
+      const currentAnalyser = this.vadAnalyser;
+      if (!currentAnalyser) {
+        return;
+      }
+
+      currentAnalyser.getByteTimeDomainData(samples);
+      if (hasVoiceActivity(samples)) {
+        this.voiceDetectedSinceLastChunk = true;
+      }
+    }, 50);
   }
 
   private setStatus(status: AudioConnectionStatus): void {
