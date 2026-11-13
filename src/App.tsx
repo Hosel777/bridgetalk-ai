@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dashboard } from './components/Dashboard.js';
 import { LearningModule } from './components/LearningModule.js';
 import { TranslatorPanel } from './components/TranslatorPanel.js';
@@ -8,6 +8,10 @@ import {
   type AudioLanguage,
   type TranscriptEvent,
 } from './services/audioStreamService.js';
+import {
+  fetchLearningSummary,
+  type LearningSummary,
+} from './services/learningSummaryService.js';
 
 function getAudioWebSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -25,9 +29,22 @@ export default function App(): React.JSX.Element {
   const [jobDescription, setJobDescription] = useState('');
   const [isContextSaved, setIsContextSaved] = useState(false);
   const [isSavingContext, setIsSavingContext] = useState(false);
+  const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(
+    null,
+  );
+  const [isRefreshingLearningSummary, setIsRefreshingLearningSummary] =
+    useState(false);
+  const [learningSummaryError, setLearningSummaryError] = useState<string | null>(
+    null,
+  );
+  const [learnedVocabularyGapIds, setLearnedVocabularyGapIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const learningSummaryRequestId = useRef(0);
 
   useEffect(
     () => () => {
+      learningSummaryRequestId.current += 1;
       void audioService.disconnect();
     },
     [audioService],
@@ -51,6 +68,7 @@ export default function App(): React.JSX.Element {
         onEvent: (event) => {
           if (event.type === 'session.started') {
             setSessionId(event.sessionId);
+            void refreshLearningSummary();
           }
           if (
             event.type === 'translation.result' ||
@@ -62,6 +80,12 @@ export default function App(): React.JSX.Element {
                 event.errorMessage ?? 'No se pudo completar el procesamiento de IA.',
               );
             }
+            if (
+              event.type === 'translation.result' &&
+              (event.originalText.trim() || event.status === 'error')
+            ) {
+              void refreshLearningSummary();
+            }
           }
         },
       });
@@ -70,6 +94,34 @@ export default function App(): React.JSX.Element {
         error instanceof Error ? error.message : 'No se pudo iniciar el audio.',
       );
     }
+  }
+
+  async function refreshLearningSummary(): Promise<void> {
+    const requestId = ++learningSummaryRequestId.current;
+    setIsRefreshingLearningSummary(true);
+    setLearningSummaryError(null);
+    try {
+      const summary = await fetchLearningSummary(sessionId);
+      if (requestId === learningSummaryRequestId.current) {
+        setLearningSummary(summary);
+      }
+    } catch (error: unknown) {
+      if (requestId === learningSummaryRequestId.current) {
+        setLearningSummaryError(
+          error instanceof Error
+            ? error.message
+            : 'No se pudo sincronizar el resumen de aprendizaje.',
+        );
+      }
+    } finally {
+      if (requestId === learningSummaryRequestId.current) {
+        setIsRefreshingLearningSummary(false);
+      }
+    }
+  }
+
+  function markVocabularyGapLearned(id: string): void {
+    setLearnedVocabularyGapIds((current) => new Set(current).add(id));
   }
 
   async function saveContext(): Promise<void> {
@@ -156,7 +208,14 @@ export default function App(): React.JSX.Element {
           entries={transcripts}
           isConnected={status === 'connected'}
         />
-        <LearningModule />
+        <LearningModule
+          learningSummary={learningSummary}
+          isRefreshing={isRefreshingLearningSummary}
+          refreshError={learningSummaryError}
+          learnedVocabularyGapIds={learnedVocabularyGapIds}
+          onRefresh={() => void refreshLearningSummary()}
+          onMarkLearned={markVocabularyGapLearned}
+        />
       </div>
     </main>
   );

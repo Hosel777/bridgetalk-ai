@@ -43,3 +43,56 @@ test('rejects invalid session identifiers and unknown session writes', () => {
     false,
   );
 });
+
+test('calculates independence from direct English and translated interventions', () => {
+  const contextManager = new ContextManager();
+  const sessionId = contextManager.createSession();
+
+  assert.equal(contextManager.getLearningSummary(sessionId)?.independenceScore, 0);
+  contextManager.recordIntervention(sessionId, 'en');
+  contextManager.recordIntervention(sessionId, 'es');
+  contextManager.recordIntervention(sessionId, 'es');
+
+  const summary = contextManager.getLearningSummary(sessionId);
+  assert.equal(summary?.independenceScore, 33);
+  assert.equal(summary?.directEnglishInterventions, 1);
+  assert.equal(summary?.translatedInterventions, 2);
+});
+
+test('stores unique Spanish-to-English technical flashcards and study steps', () => {
+  const contextManager = new ContextManager();
+  const sessionId = contextManager.createSession();
+  const phrase = 'Diseñé una API escalable en TypeScript.';
+  const translation = 'I designed a scalable API in TypeScript.';
+
+  const spanishToEnglish = {
+    sourceLanguage: 'es' as const,
+    targetLanguage: 'en' as const,
+    originalText: phrase,
+    translatedText: translation,
+  };
+  contextManager.recordTranslation(sessionId, spanishToEnglish);
+  contextManager.recordTranslation(sessionId, spanishToEnglish);
+  contextManager.recordTranslation(sessionId, {
+    sourceLanguage: 'en',
+    targetLanguage: 'es',
+    originalText: translation,
+    translatedText: phrase,
+  });
+
+  const summary = contextManager.getLearningSummary(sessionId);
+  assert.ok(summary);
+  assert.equal(summary.vocabularyGaps.length, 1);
+  const gap = summary.vocabularyGaps[0];
+  assert.ok(gap);
+  assert.equal(typeof gap.id, 'string');
+  assert.deepEqual(summary.vocabularyGaps[0], {
+    id: gap.id,
+    originalSpanish: phrase,
+    nativeEnglish: translation,
+    technicalTerm: 'API',
+    category: 'Backend',
+  });
+  assert.match(summary.studyPlan[0] ?? '', /API/);
+  assert.match(summary.studyPlan[0] ?? '', /scalable API/);
+});

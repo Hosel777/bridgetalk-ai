@@ -70,6 +70,31 @@ test('saves bounded CV and job context for a session', async () => {
   });
 });
 
+test('returns the session learning score, technical flashcards, and study plan', async () => {
+  const sessionId = contextManager.createSession();
+  contextManager.recordIntervention(sessionId, 'en');
+  contextManager.recordIntervention(sessionId, 'es');
+  contextManager.recordTranslation(sessionId, {
+    sourceLanguage: 'es',
+    targetLanguage: 'en',
+    originalText: 'Diseñé una API escalable.',
+    translatedText: 'I designed a scalable API.',
+  });
+
+  const response = await fetch(
+    `${serverUrl}/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  const summary = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(summary.sessionId, sessionId);
+  assert.equal(summary.independenceScore, 50);
+  assert.equal(summary.directEnglishInterventions, 1);
+  assert.equal(summary.translatedInterventions, 1);
+  assert.equal(summary.vocabularyGaps.length, 1);
+  assert.match(summary.studyPlan[0], /API/);
+});
+
 test('relays binary audio between legacy clients', async () => {
   const sender = new WebSocket(`${serverUrl.replace('http:', 'ws:')}/audio`, {
     origin: 'http://localhost:5173',
@@ -90,6 +115,80 @@ test('relays binary audio between legacy clients', async () => {
   sender.close();
   receiver.close();
   await closed;
+});
+
+test('counts English-origin audio as an independent intervention', async () => {
+  const sessionId = contextManager.createSession();
+  const socket = new WebSocket(`${serverUrl.replace('http:', 'ws:')}/audio`, {
+    origin: 'http://localhost:5173',
+  });
+  await once(socket, 'open');
+
+  const nextMessage = async (): Promise<Record<string, unknown>> => {
+    const [data] = await once(socket, 'message');
+    assert.ok(data instanceof Buffer);
+    return JSON.parse(data.toString()) as Record<string, unknown>;
+  };
+  socket.send(
+    JSON.stringify({
+      type: 'session.start',
+      sessionId,
+      sourceLanguage: 'en',
+      targetLanguage: 'es',
+      audioMimeType: 'audio/webm',
+    }),
+  );
+  assert.equal((await nextMessage()).type, 'session.started');
+  socket.send(Buffer.from([1, 2, 3]));
+  assert.equal((await nextMessage()).type, 'translation.result');
+
+  const response = await fetch(
+    `${serverUrl}/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  const summary = await response.json();
+  assert.equal(summary.independenceScore, 100);
+
+  const socketClosed = once(socket, 'close');
+  socket.close();
+  await socketClosed;
+});
+
+test('records translated Spanish audio in the learning summary', async () => {
+  const sessionId = contextManager.createSession();
+  const socket = new WebSocket(`${serverUrl.replace('http:', 'ws:')}/audio`, {
+    origin: 'http://localhost:5173',
+  });
+  await once(socket, 'open');
+
+  const nextMessage = async (): Promise<Record<string, unknown>> => {
+    const [data] = await once(socket, 'message');
+    assert.ok(data instanceof Buffer);
+    return JSON.parse(data.toString()) as Record<string, unknown>;
+  };
+  socket.send(
+    JSON.stringify({
+      type: 'session.start',
+      sessionId,
+      sourceLanguage: 'es',
+      targetLanguage: 'en',
+      audioMimeType: 'audio/webm',
+    }),
+  );
+  assert.equal((await nextMessage()).type, 'session.started');
+  socket.send(Buffer.from([1, 2, 3]));
+  assert.equal((await nextMessage()).type, 'translation.result');
+
+  const response = await fetch(
+    `${serverUrl}/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  const summary = await response.json();
+  assert.equal(summary.independenceScore, 0);
+  assert.equal(summary.vocabularyGaps.length, 1);
+  assert.match(summary.vocabularyGaps[0].category, /Rendimiento/);
+
+  const socketClosed = once(socket, 'close');
+  socket.close();
+  await socketClosed;
 });
 
 test('processes audio and confidence requests through the session pipeline', async () => {

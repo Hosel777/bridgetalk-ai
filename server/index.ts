@@ -248,6 +248,32 @@ export function createBridgeTalkServer(
     },
   );
 
+  app.get('/api/learning-summary', (request: Request, response: Response) => {
+    const sessionId = request.query.sessionId;
+    if (typeof sessionId !== 'string' || !isValidSessionId(sessionId)) {
+      response.status(400).json({
+        error: {
+          code: 'INVALID_SESSION_ID',
+          message: 'Provide a valid sessionId query parameter.',
+        },
+      });
+      return;
+    }
+
+    const summary = contextManager.getLearningSummary(sessionId);
+    if (!summary) {
+      response.status(404).json({
+        error: {
+          code: 'SESSION_NOT_FOUND',
+          message: 'No learning data exists for this session.',
+        },
+      });
+      return;
+    }
+
+    response.status(200).json({ sessionId, ...summary });
+  });
+
   const server: Server = createServer(app);
   const wss = new WebSocketServer({
     noServer: true,
@@ -335,6 +361,7 @@ export function createBridgeTalkServer(
         return;
       }
 
+      contextManager.recordIntervention(sessionId, sourceLanguage);
       const context = contextManager.getContext(sessionId) ?? {
         candidateCv: '',
         jobDescription: '',
@@ -345,16 +372,16 @@ export function createBridgeTalkServer(
         targetLanguage,
         context,
       );
-      const audioOutput = await pipeline.synthesizeSpeech(
-        translatedText,
-        targetLanguage,
-      );
       contextManager.recordTranslation(sessionId, {
         sourceLanguage,
         targetLanguage,
         originalText: transcription.text,
         translatedText,
       });
+      const audioOutput = await pipeline.synthesizeSpeech(
+        translatedText,
+        targetLanguage,
+      );
 
       sendJson(webSocket, {
         type: 'translation.result',
