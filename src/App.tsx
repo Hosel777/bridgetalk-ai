@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Dashboard } from './components/Dashboard.js';
+import {
+  LandingPage,
+  type LandingAccessMode,
+} from './components/LandingPage.js';
 import { LearningModule } from './components/LearningModule.js';
 import { TranslatorPanel } from './components/TranslatorPanel.js';
 import {
@@ -18,8 +22,23 @@ import {
   requestAudioOutputDevice,
   type AudioDeviceCatalog,
 } from './services/audioDeviceService.js';
+import { openPaddleCheckout } from './services/paddleCheckoutService.js';
 
 export default function App(): React.JSX.Element {
+  const [accessPlan, setAccessPlan] = useState<
+    'trial' | 'pro' | 'demo' | null
+  >(null);
+  const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const paddleClientToken =
+    import.meta.env.VITE_PADDLE_CLIENT_TOKEN?.trim() ?? '';
+  const paddlePriceId = import.meta.env.VITE_PADDLE_PRICE_ID?.trim() ?? '';
+  const landingAccessMode: LandingAccessMode =
+    paddleClientToken && paddlePriceId
+      ? 'paddle'
+      : paddleClientToken || paddlePriceId
+        ? 'misconfigured'
+        : 'demo';
   const [audioService] = useState(() => new AudioStreamService());
   const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
   const [status, setStatus] = useState<AudioConnectionStatus>('disconnected');
@@ -68,6 +87,13 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     let isCurrent = true;
+    if (accessPlan === null) {
+      setIsLoadingAudioDevices(false);
+      return () => {
+        isCurrent = false;
+      };
+    }
+
     setIsLoadingAudioDevices(true);
 
     void enumerateAudioDevices()
@@ -106,7 +132,43 @@ export default function App(): React.JSX.Element {
     return () => {
       isCurrent = false;
     };
-  }, [audioDeviceRefreshKey]);
+  }, [accessPlan, audioDeviceRefreshKey]);
+
+  function enterDashboard(plan: 'trial' | 'pro' | 'demo'): void {
+    setCheckoutError(null);
+    setAccessPlan(plan);
+  }
+
+  async function subscribeToPro(): Promise<void> {
+    setCheckoutError(null);
+    if (landingAccessMode === 'demo') {
+      enterDashboard('pro');
+      return;
+    }
+    if (landingAccessMode === 'misconfigured') {
+      setCheckoutError(
+        'Configura VITE_PADDLE_CLIENT_TOKEN y VITE_PADDLE_PRICE_ID para habilitar el checkout.',
+      );
+      return;
+    }
+
+    setIsCheckoutLoading(true);
+    try {
+      await openPaddleCheckout(
+        paddleClientToken,
+        paddlePriceId,
+        () => enterDashboard('pro'),
+      );
+    } catch (error: unknown) {
+      setCheckoutError(
+        error instanceof Error
+          ? error.message
+          : 'No se pudo abrir Paddle Checkout.',
+      );
+    } finally {
+      setIsCheckoutLoading(false);
+    }
+  }
 
   function refreshAudioDevices(): void {
     setAudioDeviceRefreshKey((current) => current + 1);
@@ -270,6 +332,19 @@ export default function App(): React.JSX.Element {
         error instanceof Error ? error.message : 'No se pudo generar la presentación.',
       );
     }
+  }
+
+  if (accessPlan === null) {
+    return (
+      <LandingPage
+        accessMode={landingAccessMode}
+        isCheckoutLoading={isCheckoutLoading}
+        checkoutError={checkoutError}
+        onSignIn={() => enterDashboard('demo')}
+        onStartTrial={() => enterDashboard('trial')}
+        onSubscribe={() => void subscribeToPro()}
+      />
+    );
   }
 
   return (
