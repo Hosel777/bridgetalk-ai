@@ -8,6 +8,8 @@ import {
   AiPipelineError,
   createAiPipeline,
   type AiPipeline,
+  type DeepgramTranscriptionEvent,
+  type DeepgramTranscriptionStream,
 } from './services/aiPipeline.js';
 import {
   ContextManager,
@@ -19,6 +21,7 @@ import {
 
 export const PORT = Number(process.env.PORT ?? 3001);
 const MAX_AUDIO_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_PENDING_AUDIO_BYTES = 2 * 1024 * 1024;
 export const AUDIO_PATH = '/audio';
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:5173',
@@ -323,6 +326,12 @@ export function createBridgeTalkServer(
     let targetLanguage: SessionLanguage = 'en';
     let audioMimeType = 'audio/webm';
     let processingQueue = Promise.resolve();
+    let deepgramStream: DeepgramTranscriptionStream | null = null;
+    let isStreamStarting = false;
+    let sessionEnding = false;
+    let streamGeneration = 0;
+    let pendingAudio: Buffer[] = [];
+    let pendingAudioBytes = 0;
 
     const enqueue = (task: () => Promise<void>): void => {
       processingQueue = processingQueue.then(task).catch((error: unknown) => {
@@ -336,65 +345,85 @@ export function createBridgeTalkServer(
       });
     };
 
-    const processAudio = async (audio: Buffer): Promise<void> => {
-      if (!sessionId) {
-        return;
-      }
-      const transcription = await pipeline.transcribeAudio(
-        audio,
-        audioMimeType,
-        sourceLanguage,
-      );
-      if (!transcription.text) {
+    const processTranscription = async (
+      text: string,
+      status: 'ok' | 'sandbox',
+      activeSessionId: string,
+      activeSourceLanguage: SessionLanguage,
+      activeTargetLanguage: SessionLanguage,
+    ): Promise<void> => {
+      if (!text) {
         sendJson(webSocket, {
           type: 'translation.result',
           id: randomUUID(),
-          sourceLanguage,
-          targetLanguage,
+          sourceLanguage: activeSourceLanguage,
+          targetLanguage: activeTargetLanguage,
           originalText: '',
           translatedText: '',
           audioBase64: null,
           audioMimeType: null,
-          status: transcription.status,
+          status,
           timestamp: new Date().toISOString(),
         });
         return;
       }
 
-      contextManager.recordIntervention(sessionId, sourceLanguage);
-      const context = contextManager.getContext(sessionId) ?? {
+      contextManager.recordIntervention(activeSessionId, activeSourceLanguage);
+      const context = contextManager.getContext(activeSessionId) ?? {
         candidateCv: '',
         jobDescription: '',
       };
       const translatedText = await pipeline.translateWithContext(
-        transcription.text,
-        sourceLanguage,
-        targetLanguage,
+        text,
+        activeSourceLanguage,
+        activeTargetLanguage,
         context,
       );
-      contextManager.recordTranslation(sessionId, {
-        sourceLanguage,
-        targetLanguage,
-        originalText: transcription.text,
+      contextManager.recordTranslation(activeSessionId, {
+        sourceLanguage: activeSourceLanguage,
+        targetLanguage: activeTargetLanguage,
+        originalText: text,
         translatedText,
       });
       const audioOutput = await pipeline.synthesizeSpeech(
         translatedText,
-        targetLanguage,
+        activeTargetLanguage,
       );
 
       sendJson(webSocket, {
         type: 'translation.result',
         id: randomUUID(),
-        sourceLanguage,
-        targetLanguage,
-        originalText: transcription.text,
+        sourceLanguage: activeSourceLanguage,
+        targetLanguage: activeTargetLanguage,
+        originalText: text,
         translatedText,
         audioBase64: audioOutput.toString('base64'),
         audioMimeType: 'audio/wav',
-        status: transcription.status,
+        status,
         timestamp: new Date().toISOString(),
       });
+    };
+
+    const processAudio = async (audio: Buffer): Promise<void> => {
+      const activeSessionId = sessionId;
+      if (!activeSessionId) {
+        return;
+      }
+
+      const activeSourceLanguage = sourceLanguage;
+      const activeTargetLanguage = targetLanguage;
+      const transcription = await pipeline.transcribeAudio(
+        audio,
+        audioMimeType,
+        activeSourceLanguage,
+      );
+      await processTranscription(
+        transcription.text,
+        transcription.status,
+        activeSessionId,
+        activeSourceLanguage,
+        activeTargetLanguage,
+      );
     };
 
     const processConfidenceSeal = async (): Promise<void> => {
@@ -442,11 +471,205 @@ export function createBridgeTalkServer(
       });
     };
 
+    const reportStreamingError = (error: unknown): void => {
+      sendJson(webSocket, {
+        type: 'error',
+        code:
+          error instanceof AiPipelineError
+            ? error.code
+            : 'DEEPGRAM_STREAM_ERROR',
+        message:
+          error instanceof AiPipelineError
+            ? error.message
+            : 'The live transcription stream failed.',
+      });
+    };
+
+    const handleDeepgramEvent = (
+      event: DeepgramTranscriptionEvent,
+      generation: number,
+      activeSessionId: string,
+      activeSourceLanguage: SessionLanguage,
+      activeTargetLanguage: SessionLanguage,
+    ): void => {
+      if (generation !== streamGeneration || !sessionActive) {
+        return;
+      }
+
+      if (event.type === 'partial') {
+        if (!sessionEnding) {
+          sendJson(webSocket, {
+            type: 'transcription.partial',
+            interimText: event.text,
+            sourceLanguage: activeSourceLanguage,
+            targetLanguage: activeTargetLanguage,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return;
+      }
+
+      if (event.type === 'final') {
+        enqueue(() =>
+          processTranscription(
+            event.text,
+            'ok',
+            activeSessionId,
+            activeSourceLanguage,
+            activeTargetLanguage,
+          ),
+        );
+        return;
+      }
+
+      reportStreamingError(event.error);
+    };
+
+    const clearPendingAudio = (): void => {
+      pendingAudio = [];
+      pendingAudioBytes = 0;
+    };
+
+    const finishSession = async (): Promise<void> => {
+      const activeStream = deepgramStream;
+      deepgramStream = null;
+      try {
+        await activeStream?.close();
+        await processingQueue;
+      } catch (error: unknown) {
+        reportStreamingError(error);
+      }
+      sessionActive = false;
+      sessionEnding = false;
+      isStreamStarting = false;
+      streamGeneration += 1;
+      clearPendingAudio();
+      sendJson(webSocket, { type: 'session.stopped' });
+    };
+
+    const startSession = (start: SessionStartMessage): void => {
+      if (sessionActive || isStreamStarting) {
+        sendJson(webSocket, {
+          type: 'error',
+          code: 'SESSION_ALREADY_STARTED',
+          message: 'Stop the active audio session before starting another.',
+        });
+        return;
+      }
+
+      sessionId = start.sessionId;
+      sourceLanguage = start.sourceLanguage;
+      targetLanguage = start.targetLanguage;
+      audioMimeType = start.audioMimeType;
+      sessionActive = true;
+      sessionEnding = false;
+      clearPendingAudio();
+      const generation = ++streamGeneration;
+      const activeSessionId = start.sessionId;
+      const activeSourceLanguage = start.sourceLanguage;
+      const activeTargetLanguage = start.targetLanguage;
+      const openTranscriptionStream = pipeline.openTranscriptionStream;
+
+      const sendSessionStarted = (): void => {
+        sendJson(webSocket, {
+          type: 'session.started',
+          sessionId: activeSessionId,
+          sourceLanguage: activeSourceLanguage,
+          targetLanguage: activeTargetLanguage,
+          pipeline: pipelineConfiguration,
+        });
+      };
+
+      if (!openTranscriptionStream) {
+        sendSessionStarted();
+        return;
+      }
+
+      isStreamStarting = true;
+      void (async (): Promise<void> => {
+        try {
+          const stream = await openTranscriptionStream({
+            audioMimeType: start.audioMimeType,
+            sourceLanguage: activeSourceLanguage,
+            onEvent: (event) =>
+              handleDeepgramEvent(
+                event,
+                generation,
+                activeSessionId,
+                activeSourceLanguage,
+                activeTargetLanguage,
+              ),
+          });
+          if (
+            generation !== streamGeneration ||
+            webSocket.readyState !== WebSocket.OPEN
+          ) {
+            await stream?.close();
+            return;
+          }
+
+          deepgramStream = stream;
+          isStreamStarting = false;
+          const queuedAudio = pendingAudio;
+          clearPendingAudio();
+          for (const audio of queuedAudio) {
+            if (stream) {
+              stream.sendAudio(audio);
+            } else {
+              enqueue(() => processAudio(audio));
+            }
+          }
+          sendSessionStarted();
+          if (sessionEnding) {
+            void finishSession();
+          }
+        } catch (error: unknown) {
+          if (generation !== streamGeneration) {
+            return;
+          }
+          sessionActive = false;
+          sessionEnding = false;
+          isStreamStarting = false;
+          clearPendingAudio();
+          reportStreamingError(error);
+        }
+      })();
+    };
+
     webSocket.on('message', (data: RawData, isBinary: boolean) => {
       if (isBinary) {
         const audio = toBuffer(data);
         if (!sessionActive) {
           broadcastAudio(audio, webSocket);
+          return;
+        }
+        if (sessionEnding) {
+          return;
+        }
+        if (deepgramStream) {
+          try {
+            deepgramStream.sendAudio(audio);
+          } catch (error: unknown) {
+            reportStreamingError(error);
+          }
+          return;
+        }
+        if (isStreamStarting) {
+          if (pendingAudioBytes + audio.length > MAX_PENDING_AUDIO_BYTES) {
+            streamGeneration += 1;
+            sessionActive = false;
+            isStreamStarting = false;
+            clearPendingAudio();
+            reportStreamingError(
+              new AiPipelineError(
+                'AUDIO_STREAM_START_TIMEOUT',
+                'Audio arrived before the live transcription stream was ready.',
+              ),
+            );
+            return;
+          }
+          pendingAudio.push(audio);
+          pendingAudioBytes += audio.length;
           return;
         }
         enqueue(() => processAudio(audio));
@@ -462,7 +685,22 @@ export function createBridgeTalkServer(
       }
 
       if (isRecord(message) && message.type === 'session.stop') {
+        if (sessionEnding) {
+          return;
+        }
+        if (isStreamStarting) {
+          sessionEnding = true;
+          return;
+        }
+        if (deepgramStream) {
+          sessionEnding = true;
+          void finishSession();
+          return;
+        }
         sessionActive = false;
+        sessionEnding = false;
+        streamGeneration += 1;
+        clearPendingAudio();
         sendJson(webSocket, { type: 'session.stopped' });
         return;
       }
@@ -513,22 +751,21 @@ export function createBridgeTalkServer(
         return;
       }
 
-      sessionId = sessionStart.sessionId;
-      sourceLanguage = sessionStart.sourceLanguage;
-      targetLanguage = sessionStart.targetLanguage;
-      audioMimeType = sessionStart.audioMimeType;
-      sessionActive = true;
-      sendJson(webSocket, {
-        type: 'session.started',
-        sessionId,
-        sourceLanguage,
-        targetLanguage,
-        pipeline: pipelineConfiguration,
-      });
+      startSession(sessionStart);
     });
 
     webSocket.on('close', () => {
       audioSessions.delete(webSocket);
+      sessionActive = false;
+      sessionEnding = true;
+      streamGeneration += 1;
+      isStreamStarting = false;
+      clearPendingAudio();
+      const activeStream = deepgramStream;
+      deepgramStream = null;
+      void activeStream?.close().catch(() => {
+        console.error('Deepgram streaming cleanup failed.');
+      });
     });
 
     webSocket.on('error', () => {

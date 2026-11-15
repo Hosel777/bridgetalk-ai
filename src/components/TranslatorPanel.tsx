@@ -1,23 +1,30 @@
 import { useEffect, useRef, type ReactElement } from 'react';
 import { ArrowDown, ArrowRight, Languages } from 'lucide-react';
 import { setAudioOutputDevice } from '../services/audioDeviceService.js';
-import type { TranscriptEvent } from '../services/audioStreamService.js';
+import type {
+  AudioLanguage,
+  TranscriptEvent,
+} from '../services/audioStreamService.js';
 
 interface TranslatorPanelProps {
   entries: TranscriptEvent[];
   isConnected: boolean;
+  interimText: string;
+  interimLanguage: AudioLanguage | null;
   outputDeviceId: string;
   supportsOutputRouting: boolean;
   onOutputError: (message: string) => void;
 }
 
-function languageName(language: TranscriptEvent['sourceLanguage']): string {
+function languageName(language: AudioLanguage): string {
   return language === 'es' ? 'Español' : 'English';
 }
 
 export function TranslatorPanel({
   entries,
   isConnected,
+  interimText,
+  interimLanguage,
   outputDeviceId,
   supportsOutputRouting,
   onOutputError,
@@ -79,7 +86,7 @@ export function TranslatorPanel({
         </span>
       </header>
 
-      {entries.length === 0 ? (
+      {entries.length === 0 && !interimText ? (
         <div className="flex min-h-56 flex-col items-center justify-center px-6 py-10 text-center">
           <Languages aria-hidden="true" className="h-7 w-7 text-slate-400" />
           <p className="mt-3 text-sm font-medium text-slate-700">
@@ -163,6 +170,28 @@ export function TranslatorPanel({
               </article>
             </li>
           ))}
+          {interimText && interimLanguage && (
+            <li
+              key="interim-transcription"
+              aria-label="Transcripción parcial"
+              className="rounded-md border border-teal-100 bg-teal-50/60 p-4"
+            >
+              <article
+                aria-label={`Transcripción en curso en ${languageName(interimLanguage)}`}
+              >
+                <p className="text-xs font-semibold uppercase tracking-wide text-teal-800">
+                  En curso · {languageName(interimLanguage)}
+                </p>
+                <p
+                  aria-live="polite"
+                  aria-atomic="true"
+                  className="mt-1 text-sm leading-6 text-slate-800"
+                >
+                  {interimText}
+                </p>
+              </article>
+            </li>
+          )}
         </ol>
       )}
     </section>

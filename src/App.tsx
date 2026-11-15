@@ -29,6 +29,10 @@ export default function App(): React.JSX.Element {
   const [status, setStatus] = useState<AudioConnectionStatus>('disconnected');
   const [sourceLanguage, setSourceLanguage] = useState<AudioLanguage>('es');
   const [transcripts, setTranscripts] = useState<TranscriptEvent[]>([]);
+  const [interimTranscript, setInterimTranscript] = useState('');
+  const [interimLanguage, setInterimLanguage] = useState<AudioLanguage | null>(
+    null,
+  );
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [candidateCv, setCandidateCv] = useState('');
   const [jobDescription, setJobDescription] = useState('');
@@ -145,13 +149,25 @@ export default function App(): React.JSX.Element {
         onError: (error) => setConnectionError(error.message),
         onEvent: (event) => {
           if (event.type === 'session.started') {
+            setInterimTranscript('');
+            setInterimLanguage(null);
             setSessionId(event.sessionId);
             void refreshLearningSummary();
+          }
+          if (event.type === 'transcription.partial') {
+            setInterimTranscript(event.interimText);
+            setInterimLanguage(event.sourceLanguage);
+          }
+          if (event.type === 'session.stopped' || event.type === 'error') {
+            setInterimTranscript('');
+            setInterimLanguage(null);
           }
           if (
             event.type === 'translation.result' ||
             event.type === 'confidence.result'
           ) {
+            setInterimTranscript('');
+            setInterimLanguage(null);
             setTranscripts((current) => [...current, event]);
             if (event.status === 'error') {
               setConnectionError(
@@ -296,6 +312,8 @@ export default function App(): React.JSX.Element {
         <TranslatorPanel
           entries={transcripts}
           isConnected={status === 'connected'}
+          interimText={interimTranscript}
+          interimLanguage={interimLanguage}
           outputDeviceId={outputDeviceId}
           supportsOutputRouting={audioDevices.supportsOutputRouting}
           onOutputError={setAudioDeviceError}

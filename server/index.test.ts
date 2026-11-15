@@ -3,7 +3,10 @@ import { once } from 'node:events';
 import { after, before, test } from 'node:test';
 import WebSocket from 'ws';
 import { ContextManager } from './services/contextManager.js';
-import type { AiPipeline } from './services/aiPipeline.js';
+import type {
+  AiPipeline,
+  DeepgramTranscriptionEvent,
+} from './services/aiPipeline.js';
 import { createBridgeTalkServer } from './index.js';
 
 const contextManager = new ContextManager();
@@ -239,4 +242,127 @@ test('processes audio and confidence requests through the session pipeline', asy
   const socketClosed = once(socket, 'close');
   socket.close();
   await socketClosed;
+});
+
+test('forwards interim Deepgram text and translates only final transcripts', {
+  timeout: 5_000,
+}, async () => {
+  const streamingContextManager = new ContextManager();
+  let emitDeepgramEvent:
+    | ((event: DeepgramTranscriptionEvent) => void)
+    | null = null;
+  const streamedAudio: Buffer[] = [];
+  let transcriptionRequests = 0;
+  let translationRequests = 0;
+  let resolveAudioForwarded: (() => void) | null = null;
+  const streamingPipeline: AiPipeline = {
+    openTranscriptionStream: async ({ onEvent }) => {
+      emitDeepgramEvent = onEvent;
+      return {
+        sendAudio: (audio) => {
+          streamedAudio.push(Buffer.from(audio));
+          resolveAudioForwarded?.();
+        },
+        close: async () => undefined,
+      };
+    },
+    transcribeAudio: async () => {
+      transcriptionRequests += 1;
+      return { text: '', status: 'sandbox' };
+    },
+    translateWithContext: async (text) => {
+      translationRequests += 1;
+      return `Translated: ${text}`;
+    },
+    synthesizeSpeech: async () => Buffer.from([1, 2, 3]),
+    generateConfidenceSeal: async () => 'Introduction.',
+  };
+  const streamingServer = createBridgeTalkServer({
+    allowedOrigins: new Set(['http://localhost:5173']),
+    contextManager: streamingContextManager,
+    pipeline: streamingPipeline,
+  });
+  let socket: WebSocket | null = null;
+
+  try {
+    await new Promise<void>((resolve) => {
+      streamingServer.server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = streamingServer.server.address();
+    assert.ok(address && typeof address !== 'string');
+    const socketUrl = `ws://127.0.0.1:${address.port}/audio`;
+    const connectedSocket = new WebSocket(socketUrl, {
+      origin: 'http://localhost:5173',
+    });
+    socket = connectedSocket;
+    await once(connectedSocket, 'open');
+
+    const nextMessage = async (): Promise<Record<string, unknown>> => {
+      const [data] = await once(connectedSocket, 'message');
+      assert.ok(data instanceof Buffer);
+      return JSON.parse(data.toString()) as Record<string, unknown>;
+    };
+
+    const sessionId = streamingContextManager.createSession();
+    const sessionStartedPromise = nextMessage();
+    connectedSocket.send(
+      JSON.stringify({
+        type: 'session.start',
+        sessionId,
+        sourceLanguage: 'es',
+        targetLanguage: 'en',
+        audioMimeType: 'audio/webm',
+      }),
+    );
+    assert.equal((await sessionStartedPromise).type, 'session.started');
+
+    const audio = Buffer.from([9, 8, 7]);
+    const audioForwarded = new Promise<void>((resolve) => {
+      resolveAudioForwarded = resolve;
+    });
+    connectedSocket.send(audio);
+    await audioForwarded;
+    const partialMessagePromise = nextMessage();
+    const emitPartial = emitDeepgramEvent;
+    assert.ok(emitPartial);
+    emitPartial({ type: 'partial', text: 'Estoy diseñando una API' });
+    const partialMessage = await partialMessagePromise;
+    assert.equal(partialMessage.type, 'transcription.partial');
+    assert.equal(partialMessage.interimText, 'Estoy diseñando una API');
+    assert.equal(translationRequests, 0);
+
+    const finalMessagePromise = nextMessage();
+    emitPartial({ type: 'final', text: 'Estoy diseñando una API escalable.' });
+    const finalMessage = await finalMessagePromise;
+    assert.equal(finalMessage.type, 'translation.result');
+    assert.equal(finalMessage.originalText, 'Estoy diseñando una API escalable.');
+    assert.equal(
+      finalMessage.translatedText,
+      'Translated: Estoy diseñando una API escalable.',
+    );
+    assert.deepEqual(streamedAudio, [audio]);
+    assert.equal(translationRequests, 1);
+    assert.equal(transcriptionRequests, 0);
+  } finally {
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      const socketClosed = once(socket, 'close');
+      socket.close();
+      await socketClosed;
+    }
+    await new Promise<void>((resolve, reject) => {
+      streamingServer.wss.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        streamingServer.server.close((serverError) => {
+          if (serverError) {
+            reject(serverError);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+  }
 });

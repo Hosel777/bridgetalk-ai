@@ -21,6 +21,14 @@ export interface TranscriptEvent {
   errorMessage?: string;
 }
 
+export interface PartialTranscriptEvent {
+  type: 'transcription.partial';
+  interimText: string;
+  sourceLanguage: AudioLanguage;
+  targetLanguage: AudioLanguage;
+  timestamp: string;
+}
+
 export type AudioServerEvent =
   | {
       type: 'session.started';
@@ -31,6 +39,7 @@ export type AudioServerEvent =
     }
   | { type: 'session.stopped' }
   | { type: 'audio.received'; bytes: number; pipeline: string }
+  | PartialTranscriptEvent
   | TranscriptEvent
   | { type: 'error'; code: string; message: string };
 
@@ -116,6 +125,22 @@ function parseServerEvent(value: unknown): AudioServerEvent | null {
         bytes: value.bytes,
         pipeline: value.pipeline,
       };
+    case 'transcription.partial':
+      if (
+        typeof value.interimText !== 'string' ||
+        !isLanguage(value.sourceLanguage) ||
+        !isLanguage(value.targetLanguage) ||
+        typeof value.timestamp !== 'string'
+      ) {
+        return null;
+      }
+      return {
+        type: 'transcription.partial',
+        interimText: value.interimText,
+        sourceLanguage: value.sourceLanguage,
+        targetLanguage: value.targetLanguage,
+        timestamp: value.timestamp,
+      };
     case 'translation.result':
     case 'confidence.result':
       if (
@@ -163,6 +188,48 @@ function parseServerEvent(value: unknown): AudioServerEvent | null {
     default:
       return null;
   }
+}
+
+function waitForSessionStarted(socket: WebSocket): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      window.clearTimeout(timeout);
+      socket.removeEventListener('message', handleMessage);
+      socket.removeEventListener('close', handleClose);
+    };
+    const fail = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const handleMessage = (message: MessageEvent<unknown>): void => {
+      if (typeof message.data !== 'string') {
+        return;
+      }
+
+      let payload: unknown;
+      try {
+        payload = JSON.parse(message.data);
+      } catch {
+        return;
+      }
+      const event = parseServerEvent(payload);
+      if (event?.type === 'session.started') {
+        cleanup();
+        resolve();
+      } else if (event?.type === 'error') {
+        fail(new Error(event.message));
+      }
+    };
+    const handleClose = (): void => {
+      fail(new Error('The audio server closed before starting the session.'));
+    };
+    const timeout = window.setTimeout(() => {
+      fail(new Error('The audio server did not start the session in time.'));
+    }, 25_000);
+
+    socket.addEventListener('message', handleMessage);
+    socket.addEventListener('close', handleClose);
+  });
 }
 
 export class AudioStreamService {
@@ -256,6 +323,7 @@ export class AudioStreamService {
       this.recorder = recorder;
       recorder.addEventListener('dataavailable', this.handleAudioData);
       recorder.addEventListener('error', this.handleRecorderError);
+      const sessionStarted = waitForSessionStarted(socket);
       socket.send(
         JSON.stringify({
           type: 'session.start',
@@ -265,7 +333,12 @@ export class AudioStreamService {
           audioMimeType: recorder.mimeType || 'audio/webm',
         }),
       );
-      recorder.start(1_000);
+      await sessionStarted;
+      if (connectionAttempt !== this.connectionAttempt) {
+        return;
+      }
+      this.voiceDetectedSinceLastChunk = false;
+      recorder.start(250);
       this.setStatus('connected');
     } catch (error: unknown) {
       const connectionError =

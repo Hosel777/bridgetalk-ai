@@ -1,3 +1,4 @@
+import WebSocket, { type RawData } from 'ws';
 import type {
   InterviewContext,
   SessionLanguage,
@@ -5,16 +6,37 @@ import type {
 
 const REQUEST_TIMEOUT_MS = 20_000;
 const DEEPGRAM_URL = 'https://api.deepgram.com/v1/listen';
+const DEEPGRAM_STREAM_URL = 'wss://api.deepgram.com/v1/listen';
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const CARTESIA_TTS_URL = 'https://api.cartesia.ai/tts/bytes';
 const CARTESIA_API_VERSION = '2026-08-14';
+const DEEPGRAM_STREAM_CLOSE_TIMEOUT_MS = 2_000;
 
 export interface TranscriptionResult {
   text: string;
   status: 'ok' | 'sandbox';
 }
 
+export type DeepgramTranscriptionEvent =
+  | { type: 'partial'; text: string }
+  | { type: 'final'; text: string }
+  | { type: 'error'; error: AiPipelineError };
+
+export interface OpenTranscriptionStreamOptions {
+  audioMimeType: string;
+  sourceLanguage: SessionLanguage;
+  onEvent: (event: DeepgramTranscriptionEvent) => void;
+}
+
+export interface DeepgramTranscriptionStream {
+  sendAudio(audio: Buffer): void;
+  close(): Promise<void>;
+}
+
 export interface AiPipeline {
+  openTranscriptionStream?(
+    options: OpenTranscriptionStreamOptions,
+  ): Promise<DeepgramTranscriptionStream | null>;
   transcribeAudio(
     audioBuffer: Buffer,
     audioMimeType?: string,
@@ -39,6 +61,10 @@ export interface AiPipeline {
 export interface AiPipelineOptions {
   env?: NodeJS.ProcessEnv;
   fetcher?: typeof fetch;
+  webSocketFactory?: (
+    url: string,
+    options: { headers: Record<string, string> },
+  ) => WebSocket;
 }
 
 export class AiPipelineError extends Error {
@@ -49,6 +75,254 @@ export class AiPipelineError extends Error {
     super(message);
     this.name = 'AiPipelineError';
   }
+}
+
+function getDeepgramTranscriptionEvent(
+  data: RawData,
+): DeepgramTranscriptionEvent | null {
+  const json = Array.isArray(data)
+    ? Buffer.concat(data).toString('utf8')
+    : Buffer.from(data).toString('utf8');
+
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (value.type === 'Error') {
+    return {
+      type: 'error',
+      error: new AiPipelineError(
+        'DEEPGRAM_STREAM_REJECTED',
+        'Deepgram rejected the live transcription stream.',
+      ),
+    };
+  }
+  if (value.type !== 'Results' || typeof value.is_final !== 'boolean') {
+    return null;
+  }
+
+  const channel = isRecord(value.channel) ? value.channel : null;
+  const alternatives =
+    channel && Array.isArray(channel.alternatives)
+      ? channel.alternatives
+      : [];
+  const firstAlternative = alternatives[0];
+  const transcript =
+    isRecord(firstAlternative) &&
+    typeof firstAlternative.transcript === 'string'
+      ? firstAlternative.transcript.trim()
+      : '';
+  if (!transcript) {
+    return null;
+  }
+
+  return value.is_final
+    ? { type: 'final', text: transcript }
+    : { type: 'partial', text: transcript };
+}
+
+async function openDeepgramTranscriptionStream(
+  apiKey: string,
+  options: OpenTranscriptionStreamOptions,
+  webSocketFactory: NonNullable<AiPipelineOptions['webSocketFactory']>,
+): Promise<DeepgramTranscriptionStream> {
+  const contentType = options.audioMimeType
+    .split(';', 1)[0]
+    ?.trim()
+    .toLowerCase();
+  if (!contentType?.startsWith('audio/')) {
+    throw new AiPipelineError(
+      'INVALID_AUDIO_TYPE',
+      'Audio must use a supported audio media type.',
+    );
+  }
+
+  const query = new URLSearchParams({
+    model: 'nova-3',
+    language: options.sourceLanguage,
+    smart_format: 'true',
+    interim_results: 'true',
+    endpointing: '300',
+  });
+  let socket: WebSocket;
+  try {
+    socket = webSocketFactory(`${DEEPGRAM_STREAM_URL}?${query}`, {
+      headers: { Authorization: `Token ${apiKey}` },
+    });
+  } catch {
+    throw new AiPipelineError(
+      'DEEPGRAM_STREAM_UNAVAILABLE',
+      'Could not open the Deepgram streaming connection.',
+    );
+  }
+
+  let isOpen = false;
+  let isClosing = false;
+  let rejectOpen: ((error: AiPipelineError) => void) | null = null;
+
+  const handleSocketError = (): void => {
+    const error = new AiPipelineError(
+      'DEEPGRAM_STREAM_UNAVAILABLE',
+      'The Deepgram streaming connection failed.',
+    );
+    if (!isOpen) {
+      rejectOpen?.(error);
+    } else if (!isClosing) {
+      options.onEvent({ type: 'error', error });
+    }
+  };
+  const handleSocketClose = (): void => {
+    if (!isOpen) {
+      rejectOpen?.(
+        new AiPipelineError(
+          'DEEPGRAM_STREAM_CLOSED',
+          'Deepgram closed the streaming connection before it was ready.',
+        ),
+      );
+    } else if (!isClosing) {
+      options.onEvent({
+        type: 'error',
+        error: new AiPipelineError(
+          'DEEPGRAM_STREAM_CLOSED',
+          'Deepgram closed the live transcription stream.',
+        ),
+      });
+    }
+  };
+  socket.on('error', handleSocketError);
+  socket.on('close', handleSocketClose);
+  socket.on('message', (data) => {
+    const event = getDeepgramTranscriptionEvent(data);
+    if (event) {
+      options.onEvent(event);
+    }
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (): void => {
+        settled = true;
+        rejectOpen = null;
+        clearTimeout(timeout);
+      };
+      const fail = (error: AiPipelineError): void => {
+        if (settled) {
+          return;
+        }
+        finish();
+        reject(error);
+      };
+      rejectOpen = fail;
+      const timeout = setTimeout(() => {
+        fail(
+          new AiPipelineError(
+            'DEEPGRAM_STREAM_TIMEOUT',
+            'Timed out while opening the Deepgram streaming connection.',
+          ),
+        );
+        socket.terminate();
+      }, REQUEST_TIMEOUT_MS);
+      timeout.unref?.();
+
+      socket.once('open', () => {
+        if (settled) {
+          return;
+        }
+        isOpen = true;
+        finish();
+        resolve();
+      });
+    });
+  } catch (error: unknown) {
+    socket.terminate();
+    if (error instanceof AiPipelineError) {
+      throw error;
+    }
+    throw new AiPipelineError(
+      'DEEPGRAM_STREAM_UNAVAILABLE',
+      'Could not open the Deepgram streaming connection.',
+    );
+  }
+
+  let closePromise: Promise<void> | null = null;
+  return {
+    sendAudio(audio): void {
+      if (audio.length === 0) {
+        return;
+      }
+      if (isClosing || socket.readyState !== WebSocket.OPEN) {
+        throw new AiPipelineError(
+          'DEEPGRAM_STREAM_CLOSED',
+          'The Deepgram streaming connection is not open.',
+        );
+      }
+
+      try {
+        socket.send(audio, (error?: Error) => {
+          if (error) {
+            options.onEvent({
+              type: 'error',
+              error: new AiPipelineError(
+                'DEEPGRAM_STREAM_SEND_FAILED',
+                'Could not send audio to the Deepgram streaming connection.',
+              ),
+            });
+          }
+        });
+      } catch {
+        throw new AiPipelineError(
+          'DEEPGRAM_STREAM_SEND_FAILED',
+          'Could not send audio to the Deepgram streaming connection.',
+        );
+      }
+    },
+    close(): Promise<void> {
+      if (closePromise) {
+        return closePromise;
+      }
+      isClosing = true;
+      closePromise = new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
+          resolve();
+        };
+        const timeout = setTimeout(() => {
+          socket.terminate();
+          finish();
+        }, DEEPGRAM_STREAM_CLOSE_TIMEOUT_MS);
+        timeout.unref?.();
+        socket.once('close', finish);
+
+        if (socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send(JSON.stringify({ type: 'CloseStream' }), (error?: Error) => {
+              if (error) {
+                socket.close();
+              }
+            });
+          } catch {
+            socket.close();
+          }
+        } else if (socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+        } else {
+          finish();
+        }
+      });
+      return closePromise;
+    },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -116,6 +390,9 @@ export function createAiPipeline(
 ): AiPipeline {
   const env = options.env ?? process.env;
   const fetcher = options.fetcher ?? globalThis.fetch;
+  const webSocketFactory =
+    options.webSocketFactory ??
+    ((url, socketOptions) => new WebSocket(url, socketOptions));
 
   async function requestOpenAiText(
     instructions: string,
@@ -177,6 +454,28 @@ export function createAiPipeline(
   }
 
   return {
+    async openTranscriptionStream(
+      streamOptions,
+    ): Promise<DeepgramTranscriptionStream | null> {
+      const provider = env.STT_PROVIDER?.trim() || 'deepgram';
+      const apiKey = env.DEEPGRAM_API_KEY?.trim();
+      if (provider === 'sandbox' || !apiKey) {
+        return null;
+      }
+      if (provider !== 'deepgram') {
+        throw new AiPipelineError(
+          'UNSUPPORTED_STT_PROVIDER',
+          'Only Deepgram and the sandbox STT provider are supported.',
+        );
+      }
+
+      return openDeepgramTranscriptionStream(
+        apiKey,
+        streamOptions,
+        webSocketFactory,
+      );
+    },
+
     async transcribeAudio(
       audioBuffer,
       audioMimeType = 'audio/webm',
