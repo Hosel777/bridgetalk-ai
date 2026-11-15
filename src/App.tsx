@@ -4,6 +4,7 @@ import { LearningModule } from './components/LearningModule.js';
 import { TranslatorPanel } from './components/TranslatorPanel.js';
 import {
   AudioStreamService,
+  getAudioWebSocketUrl,
   type AudioConnectionStatus,
   type AudioLanguage,
   type TranscriptEvent,
@@ -17,11 +18,6 @@ import {
   requestAudioOutputDevice,
   type AudioDeviceCatalog,
 } from './services/audioDeviceService.js';
-
-function getAudioWebSocketUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/audio`;
-}
 
 export default function App(): React.JSX.Element {
   const [audioService] = useState(() => new AudioStreamService());

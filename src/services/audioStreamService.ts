@@ -53,6 +53,39 @@ export interface AudioStreamOptions {
   onError?: (error: Error) => void;
 }
 
+export function getAudioWebSocketUrl(
+  backendUrl: string | undefined = import.meta.env?.VITE_BACKEND_URL,
+  currentLocation?: Pick<Location, 'protocol' | 'host'>,
+): string {
+  const configuredBackendUrl = backendUrl?.trim();
+  if (configuredBackendUrl) {
+    let parsedBackendUrl: URL;
+    try {
+      parsedBackendUrl = new URL(configuredBackendUrl);
+    } catch {
+      throw new Error('VITE_BACKEND_URL must be a valid URL.');
+    }
+
+    if (
+      parsedBackendUrl.protocol !== 'http:' &&
+      parsedBackendUrl.protocol !== 'https:'
+    ) {
+      throw new Error('VITE_BACKEND_URL must use http:// or https://.');
+    }
+
+    parsedBackendUrl.protocol =
+      parsedBackendUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    parsedBackendUrl.pathname = '/audio';
+    parsedBackendUrl.search = '';
+    parsedBackendUrl.hash = '';
+    return parsedBackendUrl.toString();
+  }
+
+  const location = currentLocation ?? window.location;
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/audio`;
+}
+
 export const VOICE_ACTIVITY_RMS_THRESHOLD = 0.025;
 
 export function shouldSendAudioChunk(
