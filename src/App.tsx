@@ -3,6 +3,7 @@ import { Dashboard } from './components/Dashboard.js';
 import {
   LandingPage,
   type LandingAccessMode,
+  type LandingAuthMode,
 } from './components/LandingPage.js';
 import { LearningModule } from './components/LearningModule.js';
 import { TranslatorPanel } from './components/TranslatorPanel.js';
@@ -23,22 +24,36 @@ import {
   type AudioDeviceCatalog,
 } from './services/audioDeviceService.js';
 import { openPaddleCheckout } from './services/paddleCheckoutService.js';
+import {
+  isSupabaseConfigured,
+  supabaseConfigurationError,
+} from './services/supabaseConfig.js';
+import type { Session, SupabaseClient } from '@supabase/supabase-js';
 
 export default function App(): React.JSX.Element {
   const [accessPlan, setAccessPlan] = useState<
     'trial' | 'pro' | 'demo' | null
   >(null);
+  const [authClient, setAuthClient] = useState<SupabaseClient | null>(null);
+  const [authSession, setAuthSession] = useState<Session | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(!isSupabaseConfigured);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [authMode, setAuthMode] = useState<LandingAuthMode>('signup');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [pendingProCheckout, setPendingProCheckout] = useState(false);
   const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const paddleClientToken =
     import.meta.env.VITE_PADDLE_CLIENT_TOKEN?.trim() ?? '';
   const paddlePriceId = import.meta.env.VITE_PADDLE_PRICE_ID?.trim() ?? '';
-  const landingAccessMode: LandingAccessMode =
-    paddleClientToken && paddlePriceId
-      ? 'paddle'
-      : paddleClientToken || paddlePriceId
-        ? 'misconfigured'
-        : 'demo';
+  const landingAccessMode: LandingAccessMode = supabaseConfigurationError
+    ? 'misconfigured'
+    : !isSupabaseConfigured
+      ? 'demo'
+      : paddleClientToken && paddlePriceId
+        ? 'paddle'
+        : 'misconfigured';
   const [audioService] = useState(() => new AudioStreamService());
   const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
   const [status, setStatus] = useState<AudioConnectionStatus>('disconnected');
@@ -76,6 +91,60 @@ export default function App(): React.JSX.Element {
   const [audioDeviceError, setAudioDeviceError] = useState<string | null>(null);
   const [isLoadingAudioDevices, setIsLoadingAudioDevices] = useState(true);
   const [audioDeviceRefreshKey, setAudioDeviceRefreshKey] = useState(0);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      setIsAuthReady(true);
+      return;
+    }
+
+    let isCurrent = true;
+    let unsubscribe: (() => void) | null = null;
+    void import('./services/supabaseAuthService.js')
+      .then(async ({ supabaseAuthClient }) => {
+        if (!isCurrent) {
+          return;
+        }
+        if (!supabaseAuthClient) {
+          setIsAuthReady(true);
+          return;
+        }
+        setAuthClient(supabaseAuthClient);
+        const {
+          data: { subscription },
+        } = supabaseAuthClient.auth.onAuthStateChange((_event, session) => {
+          if (!isCurrent) {
+            return;
+          }
+          setAuthSession(session);
+          if (!session) {
+            setAccessPlan(null);
+          }
+        });
+        unsubscribe = () => subscription.unsubscribe();
+        const { data, error } = await supabaseAuthClient.auth.getSession();
+        if (!isCurrent) {
+          return;
+        }
+        if (error) {
+          setAuthError('No se pudo restaurar la sesión. Inicia sesión de nuevo.');
+        }
+        setAuthSession(data.session);
+        setAccessPlan(data.session ? 'trial' : null);
+        setIsAuthReady(true);
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setAuthError('No se pudo comprobar la sesión de Supabase.');
+          setIsAuthReady(true);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+      unsubscribe?.();
+    };
+  }, []);
 
   useEffect(
     () => () => {
@@ -139,15 +208,18 @@ export default function App(): React.JSX.Element {
     setAccessPlan(plan);
   }
 
-  async function subscribeToPro(): Promise<void> {
+  async function openProCheckout(session: Session): Promise<void> {
     setCheckoutError(null);
-    if (landingAccessMode === 'demo') {
-      enterDashboard('pro');
+    if (landingAccessMode !== 'paddle') {
+      setCheckoutError(
+        'Configura Supabase y Paddle para habilitar una suscripción verificable.',
+      );
       return;
     }
-    if (landingAccessMode === 'misconfigured') {
+    const email = session.user.email;
+    if (!email) {
       setCheckoutError(
-        'Configura VITE_PADDLE_CLIENT_TOKEN y VITE_PADDLE_PRICE_ID para habilitar el checkout.',
+        'La cuenta autenticada debe tener un correo para vincular la compra.',
       );
       return;
     }
@@ -157,7 +229,13 @@ export default function App(): React.JSX.Element {
       await openPaddleCheckout(
         paddleClientToken,
         paddlePriceId,
-        () => enterDashboard('pro'),
+        { userId: session.user.id, email },
+        () => {
+          setAuthMessage(
+            'Pago recibido. El servidor confirmará tu suscripción de forma segura.',
+          );
+          enterDashboard('trial');
+        },
       );
     } catch (error: unknown) {
       setCheckoutError(
@@ -167,6 +245,112 @@ export default function App(): React.JSX.Element {
       );
     } finally {
       setIsCheckoutLoading(false);
+    }
+  }
+
+  async function subscribeToPro(): Promise<void> {
+    setCheckoutError(null);
+    if (!isSupabaseConfigured) {
+      if (landingAccessMode === 'demo') {
+        enterDashboard('pro');
+      } else {
+        setCheckoutError(
+          'Configura Supabase antes de habilitar una suscripción real.',
+        );
+      }
+      return;
+    }
+    if (landingAccessMode !== 'paddle') {
+      setCheckoutError(
+        'Configura VITE_PADDLE_CLIENT_TOKEN y VITE_PADDLE_PRICE_ID para habilitar el checkout.',
+      );
+      return;
+    }
+    if (!authSession) {
+      setPendingProCheckout(true);
+      setAuthMode('signin');
+      setAuthMessage('Inicia sesión para continuar con la suscripción.');
+      document.getElementById('acceso')?.scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+    await openProCheckout(authSession);
+  }
+
+  async function authenticate(
+    email: string,
+    password: string,
+  ): Promise<void> {
+    setAuthError(null);
+    setAuthMessage(null);
+    setIsAuthLoading(true);
+    try {
+      if (!authClient) {
+        throw new Error(
+          supabaseConfigurationError ?? 'Supabase Auth no está configurado.',
+        );
+      }
+
+      const result =
+        authMode === 'signup'
+          ? await authClient.auth.signUp({ email, password })
+          : await authClient.auth.signInWithPassword({
+              email,
+              password,
+            });
+      if (result.error) {
+        throw result.error;
+      }
+
+      if (!result.data.session) {
+        setAuthMessage(
+          'Revisa tu correo para confirmar la cuenta y luego inicia sesión.',
+        );
+        return;
+      }
+
+      setAuthSession(result.data.session);
+      if (pendingProCheckout) {
+        setPendingProCheckout(false);
+        await openProCheckout(result.data.session);
+      } else {
+        setAccessPlan('trial');
+      }
+    } catch (error: unknown) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'No se pudo completar la autenticación.',
+      );
+    } finally {
+      setIsAuthLoading(false);
+    }
+  }
+
+  function focusAuthForm(mode: LandingAuthMode): void {
+    setAuthMode(mode);
+    setAuthError(null);
+    setAuthMessage(null);
+    document.getElementById('acceso')?.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  async function signOut(): Promise<void> {
+    setConnectionError(null);
+    try {
+      await audioService.disconnect();
+      if (authClient) {
+        const { error } = await authClient.auth.signOut();
+        if (error) {
+          throw error;
+        }
+      }
+      setAuthSession(null);
+      setAccessPlan(null);
+    } catch (error: unknown) {
+      setConnectionError(
+        error instanceof Error
+          ? error.message
+          : 'No se pudo cerrar la sesión.',
+      );
     }
   }
 
@@ -202,6 +386,9 @@ export default function App(): React.JSX.Element {
         sessionId,
         sourceLanguage,
         targetLanguage,
+        ...(authSession?.access_token
+          ? { accessToken: authSession.access_token }
+          : {}),
         ...(inputDeviceId ? { inputDeviceId } : {}),
         onStatusChange: setStatus,
         onError: (error) => setConnectionError(error.message),
@@ -255,7 +442,10 @@ export default function App(): React.JSX.Element {
     setIsRefreshingLearningSummary(true);
     setLearningSummaryError(null);
     try {
-      const summary = await fetchLearningSummary(sessionId);
+      const summary = await fetchLearningSummary(
+        sessionId,
+        authSession?.access_token,
+      );
       if (requestId === learningSummaryRequestId.current) {
         setLearningSummary(summary);
       }
@@ -284,7 +474,12 @@ export default function App(): React.JSX.Element {
     try {
       const response = await fetch('/api/context', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authSession?.access_token
+            ? { Authorization: `Bearer ${authSession.access_token}` }
+            : {}),
+        },
         body: JSON.stringify({ sessionId, candidateCv, jobDescription }),
       });
       let payload: unknown;
@@ -335,13 +530,43 @@ export default function App(): React.JSX.Element {
   }
 
   if (accessPlan === null) {
+    if (isSupabaseConfigured && !isAuthReady) {
+      return (
+        <main className="flex min-h-screen items-center justify-center bg-slate-50 px-5 text-sm text-slate-600">
+          <p role="status">Comprobando tu sesión…</p>
+        </main>
+      );
+    }
+
     return (
       <LandingPage
         accessMode={landingAccessMode}
+        authEnabled={isSupabaseConfigured}
+        authConfigurationError={supabaseConfigurationError}
+        authMode={authMode}
+        isAuthLoading={isAuthLoading}
+        authError={authError}
+        authMessage={authMessage}
         isCheckoutLoading={isCheckoutLoading}
         checkoutError={checkoutError}
-        onSignIn={() => enterDashboard('demo')}
-        onStartTrial={() => enterDashboard('trial')}
+        onSignIn={() =>
+          isSupabaseConfigured || supabaseConfigurationError
+            ? focusAuthForm('signin')
+            : enterDashboard('demo')
+        }
+        onAuthModeChange={(mode) => {
+          setAuthMode(mode);
+          setAuthError(null);
+          setAuthMessage(null);
+        }}
+        onAuthenticate={(email, password) =>
+          void authenticate(email, password)
+        }
+        onStartTrial={() =>
+          isSupabaseConfigured || supabaseConfigurationError
+            ? focusAuthForm('signup')
+            : enterDashboard('trial')
+        }
         onSubscribe={() => void subscribeToPro()}
       />
     );
@@ -350,6 +575,23 @@ export default function App(): React.JSX.Element {
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900">
       <div className="mx-auto max-w-6xl space-y-6 px-4 py-8 sm:px-6 lg:px-8">
+        {authSession && (
+          <div className="flex flex-col gap-3 border-b border-slate-200 pb-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-sm text-slate-600">
+              Sesión iniciada como{' '}
+              <span className="font-medium text-slate-900">
+                {authSession.user.email ?? 'usuario BridgeTalk'}
+              </span>
+            </p>
+            <button
+              type="button"
+              onClick={() => void signOut()}
+              className="min-h-10 self-start rounded-lg border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-800 hover:border-teal-700 hover:text-teal-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 sm:self-auto"
+            >
+              Cerrar sesión
+            </button>
+          </div>
+        )}
         <Dashboard
           status={status}
           connectionError={connectionError}

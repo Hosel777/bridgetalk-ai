@@ -1,28 +1,49 @@
 import { Languages, Radio } from 'lucide-react';
 import {
+  EmailAuthPanel,
+  type LandingAuthMode,
+} from './EmailAuthPanel.js';
+import {
   LandingDifferentiators,
   LandingHero,
   PricingSection,
 } from './LandingPageSections.js';
 
 export { PRICING_CONFIG } from './landingPricingConfig.js';
+export type { LandingAuthMode } from './EmailAuthPanel.js';
 
 export type LandingAccessMode = 'demo' | 'paddle' | 'misconfigured';
 
 interface LandingPageProps {
   accessMode: LandingAccessMode;
+  authEnabled: boolean;
+  authConfigurationError: string | null;
+  authMode: LandingAuthMode;
+  isAuthLoading: boolean;
+  authError: string | null;
+  authMessage: string | null;
   isCheckoutLoading: boolean;
   checkoutError: string | null;
   onSignIn: () => void;
+  onAuthModeChange: (mode: LandingAuthMode) => void;
+  onAuthenticate: (email: string, password: string) => void;
   onStartTrial: () => void;
   onSubscribe: () => void;
 }
 
 export function LandingPage({
   accessMode,
+  authEnabled,
+  authConfigurationError,
+  authMode,
+  isAuthLoading,
+  authError,
+  authMessage,
   isCheckoutLoading,
   checkoutError,
   onSignIn,
+  onAuthModeChange,
+  onAuthenticate,
   onStartTrial,
   onSubscribe,
 }: LandingPageProps): React.JSX.Element {
@@ -48,7 +69,16 @@ export function LandingPage({
           >
             Planes
           </a>
-          {accessMode === 'demo' && (
+          {(authEnabled || authConfigurationError) && (
+            <a
+              href="#acceso"
+              onClick={onSignIn}
+              className="text-sm font-semibold text-slate-700 hover:text-teal-900"
+            >
+              Iniciar sesión
+            </a>
+          )}
+          {!authEnabled && !authConfigurationError && accessMode === 'demo' && (
             <button
               type="button"
               onClick={onSignIn}
@@ -62,6 +92,18 @@ export function LandingPage({
 
       <LandingHero onStartTrial={onStartTrial} />
       <LandingDifferentiators />
+      {(authEnabled || authConfigurationError) && (
+        <EmailAuthPanel
+          enabled={authEnabled}
+          configurationError={authConfigurationError}
+          mode={authMode}
+          isLoading={isAuthLoading}
+          error={authError}
+          message={authMessage}
+          onModeChange={onAuthModeChange}
+          onAuthenticate={onAuthenticate}
+        />
+      )}
       <PricingSection
         accessMode={accessMode}
         isCheckoutLoading={isCheckoutLoading}

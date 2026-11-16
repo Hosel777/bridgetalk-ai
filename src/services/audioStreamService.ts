@@ -47,6 +47,7 @@ export interface AudioStreamOptions {
   sourceLanguage: AudioLanguage;
   targetLanguage: AudioLanguage;
   sessionId?: string;
+  accessToken?: string;
   inputDeviceId?: string;
   onEvent?: (event: AudioServerEvent) => void;
   onStatusChange?: (status: AudioConnectionStatus) => void;
@@ -364,6 +365,7 @@ export class AudioStreamService {
           sourceLanguage: options.sourceLanguage,
           targetLanguage: options.targetLanguage,
           audioMimeType: recorder.mimeType || 'audio/webm',
+          ...(options.accessToken ? { accessToken: options.accessToken } : {}),
         }),
       );
       await sessionStarted;

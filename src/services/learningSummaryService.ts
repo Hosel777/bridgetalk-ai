@@ -64,9 +64,15 @@ function getErrorMessage(value: unknown): string | null {
 
 export async function fetchLearningSummary(
   sessionId: string,
+  accessToken?: string | null,
 ): Promise<LearningSummary> {
   const response = await fetch(
     `/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+    {
+      ...(accessToken
+        ? { headers: { Authorization: `Bearer ${accessToken}` } }
+        : {}),
+    },
   );
   let payload: unknown;
   try {

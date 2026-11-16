@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "start:server": "tsx server/index.ts",
-    "test": "tsx --test src/server/index.test.ts server/services/contextManager.test.ts server/services/aiPipeline.test.ts server/index.test.ts src/services/audioStreamService.test.ts src/services/audioDeviceService.test.ts",
+    "test": "tsx --test src/server/index.test.ts server/services/contextManager.test.ts server/services/aiPipeline.test.ts server/services/subscriptionService.test.ts server/index.test.ts src/services/audioStreamService.test.ts src/services/audioDeviceService.test.ts",
     "dev:client": "vite",
     "build:client": "vite build",
     "cap:sync": "npm run build:client && npx cap sync"
@@ -15,6 +15,7 @@
     "@capacitor/android": "^8.6.2",
     "@capacitor/core": "^8.6.2",
     "@capacitor/ios": "^8.6.2",
+    "@supabase/supabase-js": "^2.119.0",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",

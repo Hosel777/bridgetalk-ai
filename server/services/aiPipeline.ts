@@ -82,7 +82,9 @@ function getDeepgramTranscriptionEvent(
 ): DeepgramTranscriptionEvent | null {
   const json = Array.isArray(data)
     ? Buffer.concat(data).toString('utf8')
-    : Buffer.from(data).toString('utf8');
+    : Buffer.isBuffer(data)
+      ? data.toString('utf8')
+      : Buffer.from(data).toString('utf8');
 
   let value: unknown;
   try {
@@ -514,6 +516,8 @@ export function createAiPipeline(
         smart_format: 'true',
         language: sourceLanguage,
       });
+      const requestBody = new ArrayBuffer(audioBuffer.byteLength);
+      new Uint8Array(requestBody).set(audioBuffer);
       const response = await fetchProvider(
         fetcher,
         'DEEPGRAM_UNAVAILABLE',
@@ -525,7 +529,7 @@ export function createAiPipeline(
             Authorization: `Token ${apiKey}`,
             'Content-Type': contentType,
           },
-          body: audioBuffer,
+          body: requestBody,
         },
       );
       if (!response.ok) {

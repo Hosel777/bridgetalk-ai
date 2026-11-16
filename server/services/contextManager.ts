@@ -104,7 +104,7 @@ interface StoredSession {
 export class ContextManager {
   private readonly sessions = new Map<string, StoredSession>();
 
-  createSession(sessionId = randomUUID()): string {
+  createSession(sessionId: string = randomUUID()): string {
     if (!isValidSessionId(sessionId)) {
       throw new Error('Session ID must be a UUID.');
     }

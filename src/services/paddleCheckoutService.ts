@@ -16,6 +16,8 @@ interface PaddleSdk {
     open(options: {
       items: Array<{ priceId: string; quantity: number }>;
       settings: { locale: string };
+      customData: { user_id: string };
+      customer: { email: string };
     }): void;
   };
 }
@@ -69,12 +71,13 @@ function loadPaddleSdk(): Promise<PaddleSdk> {
 export async function openPaddleCheckout(
   clientToken: string,
   priceId: string,
+  customer: { userId: string; email: string },
   onCheckoutCompleted: () => void,
 ): Promise<void> {
   const token = clientToken.trim();
   const configuredPriceId = priceId.trim();
-  if (!token || !configuredPriceId) {
-    throw new Error('Configura el token y el ID de precio de Paddle.');
+  if (!token || !configuredPriceId || !customer.userId || !customer.email) {
+    throw new Error('Configura el checkout y una cuenta autenticada de BridgeTalk.');
   }
 
   const paddle = await loadPaddleSdk();
@@ -99,5 +102,7 @@ export async function openPaddleCheckout(
   paddle.Checkout.open({
     items: [{ priceId: configuredPriceId, quantity: 1 }],
     settings: { locale: 'es' },
+    customData: { user_id: customer.userId },
+    customer: { email: customer.email },
   });
 }

@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express, { type Express, type Request, type Response } from 'express';
 import { createServer, type Server } from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import {
   AiPipelineError,
@@ -18,6 +18,10 @@ import {
   type InterviewContext,
   type SessionLanguage,
 } from './services/contextManager.js';
+import {
+  createSubscriptionService,
+  type SubscriptionService,
+} from './services/subscriptionService.js';
 
 export const PORT = Number(process.env.PORT ?? 3001);
 const MAX_AUDIO_PAYLOAD_BYTES = 1024 * 1024;
@@ -52,12 +56,16 @@ interface SessionStartMessage {
   sourceLanguage: SessionLanguage;
   targetLanguage: SessionLanguage;
   audioMimeType: string;
+  accessToken: string | null;
 }
 
 interface ServerOptions {
   allowedOrigins?: ReadonlySet<string>;
   contextManager?: ContextManager;
   pipeline?: AiPipeline;
+  subscriptionService?: SubscriptionService;
+  paddleWebhookSecret?: string;
+  paddleProPriceId?: string;
 }
 
 export interface BridgeTalkServer {
@@ -68,6 +76,7 @@ export interface BridgeTalkServer {
 }
 
 function parseSessionStart(value: unknown): SessionStartMessage | null {
+  const accessToken = isRecord(value) ? value.accessToken : undefined;
   if (
     !isRecord(value) ||
     value.type !== 'session.start' ||
@@ -75,7 +84,9 @@ function parseSessionStart(value: unknown): SessionStartMessage | null {
     !isValidSessionId(value.sessionId) ||
     !isLanguage(value.sourceLanguage) ||
     !isLanguage(value.targetLanguage) ||
-    value.sourceLanguage === value.targetLanguage
+    value.sourceLanguage === value.targetLanguage ||
+    (accessToken !== undefined &&
+      (typeof accessToken !== 'string' || accessToken.length > 8192))
   ) {
     return null;
   }
@@ -95,7 +106,90 @@ function parseSessionStart(value: unknown): SessionStartMessage | null {
     sourceLanguage: value.sourceLanguage,
     targetLanguage: value.targetLanguage,
     audioMimeType,
+    accessToken: typeof accessToken === 'string' ? accessToken : null,
   };
+}
+
+function getBearerToken(request: Request): string | null {
+  const authorization = request.get('authorization');
+  if (!authorization) {
+    return null;
+  }
+  const match = /^Bearer ([^\s]+)$/i.exec(authorization);
+  return match?.[1] ?? null;
+}
+
+function verifyPaddleSignature(
+  body: Buffer,
+  signatureHeader: string | undefined,
+  secret: string,
+  nowMilliseconds = Date.now(),
+): boolean {
+  if (!signatureHeader) {
+    return false;
+  }
+  const fields = signatureHeader.split(';').map((field) => field.trim());
+  const timestampField = fields.find((field) => field.startsWith('ts='));
+  const hashField = fields.find((field) => field.startsWith('h1='));
+  const timestamp = timestampField?.slice(3);
+  const suppliedHash = hashField?.slice(3);
+  if (
+    !timestamp ||
+    !/^\d+$/.test(timestamp) ||
+    !suppliedHash ||
+    !/^[a-f\d]{64}$/i.test(suppliedHash)
+  ) {
+    return false;
+  }
+
+  const timestampSeconds = Number(timestamp);
+  if (
+    !Number.isSafeInteger(timestampSeconds) ||
+    Math.abs(nowMilliseconds / 1000 - timestampSeconds) > 5
+  ) {
+    return false;
+  }
+
+  const expectedHash = createHmac('sha256', secret)
+    .update(`${timestamp}:`)
+    .update(body)
+    .digest();
+  const actualHash = Buffer.from(suppliedHash, 'hex');
+  return (
+    actualHash.length === expectedHash.length &&
+    timingSafeEqual(actualHash, expectedHash)
+  );
+}
+
+function getPaddleCustomerEmail(data: Record<string, unknown>): string | null {
+  if (typeof data.customer_email === 'string') {
+    return data.customer_email;
+  }
+  for (const field of ['customer', 'billing_details'] as const) {
+    const value = data[field];
+    if (isRecord(value) && typeof value.email === 'string') {
+      return value.email;
+    }
+  }
+  return null;
+}
+
+function containsPaddlePrice(
+  data: Record<string, unknown>,
+  expectedPriceId: string,
+): boolean {
+  if (!Array.isArray(data.items)) {
+    return false;
+  }
+  return data.items.some((item: unknown) => {
+    if (!isRecord(item)) {
+      return false;
+    }
+    if (item.price_id === expectedPriceId) {
+      return true;
+    }
+    return isRecord(item.price) && item.price.id === expectedPriceId;
+  });
 }
 
 function getAllowedOrigins(): ReadonlySet<string> {
@@ -192,7 +286,177 @@ export function createBridgeTalkServer(
 
   const contextManager = options.contextManager ?? new ContextManager();
   const pipeline = options.pipeline ?? createAiPipeline();
+  const subscriptionService =
+    options.subscriptionService ?? createSubscriptionService();
+  const paddleWebhookSecret = (
+    options.paddleWebhookSecret ?? process.env.PADDLE_WEBHOOK_SECRET ?? ''
+  ).trim();
+  const paddleProPriceId = (
+    options.paddleProPriceId ??
+    process.env.PADDLE_PRO_PRICE_ID ??
+    process.env.VITE_PADDLE_PRICE_ID ??
+    ''
+  ).trim();
+  const sessionOwners = new Map<string, string>();
   const jsonParser = express.json({ limit: '100kb' });
+
+  app.post(
+    '/api/webhooks/paddle',
+    express.raw({ type: 'application/json', limit: '100kb' }),
+    async (request: Request, response: Response) => {
+      if (!paddleWebhookSecret) {
+        response.status(503).json({
+          error: {
+            code: 'PADDLE_WEBHOOK_NOT_CONFIGURED',
+            message: 'Paddle webhook processing is not configured.',
+          },
+        });
+        return;
+      }
+      if (!paddleProPriceId) {
+        response.status(503).json({
+          error: {
+            code: 'PADDLE_PRICE_NOT_CONFIGURED',
+            message: 'The Pro Paddle price is not configured.',
+          },
+        });
+        return;
+      }
+
+      if (!Buffer.isBuffer(request.body)) {
+        response.status(400).json({
+          error: {
+            code: 'INVALID_WEBHOOK_BODY',
+            message: 'The Paddle webhook body must be valid JSON.',
+          },
+        });
+        return;
+      }
+      if (
+        !verifyPaddleSignature(
+          request.body,
+          request.get('Paddle-Signature'),
+          paddleWebhookSecret,
+        )
+      ) {
+        response.status(401).json({
+          error: {
+            code: 'INVALID_PADDLE_SIGNATURE',
+            message: 'The Paddle webhook signature is missing or invalid.',
+          },
+        });
+        return;
+      }
+
+      let payload: unknown;
+      try {
+        payload = JSON.parse(request.body.toString('utf8'));
+      } catch {
+        response.status(400).json({
+          error: {
+            code: 'INVALID_WEBHOOK_BODY',
+            message: 'The Paddle webhook body must be valid JSON.',
+          },
+        });
+        return;
+      }
+      if (
+        !isRecord(payload) ||
+        typeof payload.event_type !== 'string' ||
+        !isRecord(payload.data)
+      ) {
+        response.status(422).json({
+          error: {
+            code: 'INVALID_PADDLE_EVENT',
+            message: 'The Paddle event payload is missing required fields.',
+          },
+        });
+        return;
+      }
+
+      if (
+        payload.event_type !== 'subscription.activated' &&
+        payload.event_type !== 'transaction.completed'
+      ) {
+        response.status(200).json({ received: true, ignored: true });
+        return;
+      }
+
+      const eventData = payload.data;
+      if (!containsPaddlePrice(eventData, paddleProPriceId)) {
+        response.status(200).json({ received: true, ignored: true });
+        return;
+      }
+      const customData = isRecord(eventData.custom_data)
+        ? eventData.custom_data
+        : null;
+      const userId =
+        customData && typeof customData.user_id === 'string'
+          ? customData.user_id
+          : '';
+      const email = getPaddleCustomerEmail(eventData)?.trim() ?? null;
+      const customerId =
+        typeof eventData.customer_id === 'string' ? eventData.customer_id : '';
+      const subscriptionId =
+        payload.event_type === 'subscription.activated'
+          ? typeof eventData.id === 'string'
+            ? eventData.id
+            : null
+          : typeof eventData.subscription_id === 'string'
+            ? eventData.subscription_id
+            : null;
+
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          userId,
+        ) ||
+        (email !== null &&
+          (email.length > 254 || !email.includes('@'))) ||
+        !/^ctm_[a-z\d]+$/i.test(customerId) ||
+        subscriptionId === null ||
+        subscriptionId.length > 100 ||
+        (payload.event_type === 'transaction.completed' && email === null)
+      ) {
+        response.status(422).json({
+          error: {
+            code: 'INVALID_PADDLE_CUSTOMER',
+            message:
+              'The signed Paddle event must include valid user, subscription, and customer details.',
+          },
+        });
+        return;
+      }
+
+      try {
+        const activated = await subscriptionService.activateProForPaddle({
+          userId,
+          email,
+          customerId,
+          subscriptionId,
+        });
+        if (!activated) {
+          response.status(409).json({
+            error: {
+              code: 'PADDLE_ACCOUNT_MISMATCH',
+              message:
+                'The Paddle customer email does not match the linked account.',
+            },
+          });
+          return;
+        }
+      } catch {
+        response.status(503).json({
+          error: {
+            code: 'PADDLE_ACTIVATION_FAILED',
+            message: 'The subscription could not be updated. Retry the event.',
+          },
+        });
+        return;
+      }
+
+      response.status(200).json({ received: true, activated: true });
+    },
+  );
 
   app.post(
     '/api/context',
@@ -214,7 +478,7 @@ export function createBridgeTalkServer(
         next();
       });
     },
-    (request: Request, response: Response) => {
+    async (request: Request, response: Response) => {
       const input = readContextRequest(request.body);
       if (!input) {
         response.status(422).json({
@@ -222,6 +486,28 @@ export function createBridgeTalkServer(
             code: 'INVALID_CONTEXT',
             message:
               'Provide a valid sessionId, candidateCv, and jobDescription within the size limits.',
+          },
+        });
+        return;
+      }
+      const user = await subscriptionService.authenticateAudioUser(
+        getBearerToken(request),
+      );
+      if (!user) {
+        response.status(401).json({
+          error: {
+            code: 'AUTH_REQUIRED',
+            message: 'Sign in before saving interview context.',
+          },
+        });
+        return;
+      }
+      const currentOwner = sessionOwners.get(input.sessionId);
+      if (currentOwner && currentOwner !== user.id) {
+        response.status(404).json({
+          error: {
+            code: 'SESSION_NOT_FOUND',
+            message: 'The requested session is not available.',
           },
         });
         return;
@@ -244,6 +530,7 @@ export function createBridgeTalkServer(
         });
         return;
       }
+      sessionOwners.set(input.sessionId, user.id);
       response.status(200).json({
         sessionId: input.sessionId,
         status: 'saved',
@@ -251,13 +538,38 @@ export function createBridgeTalkServer(
     },
   );
 
-  app.get('/api/learning-summary', (request: Request, response: Response) => {
+  app.get(
+    '/api/learning-summary',
+    async (request: Request, response: Response) => {
     const sessionId = request.query.sessionId;
     if (typeof sessionId !== 'string' || !isValidSessionId(sessionId)) {
       response.status(400).json({
         error: {
           code: 'INVALID_SESSION_ID',
           message: 'Provide a valid sessionId query parameter.',
+        },
+      });
+      return;
+    }
+
+    const user = await subscriptionService.authenticateAudioUser(
+      getBearerToken(request),
+    );
+    if (!user) {
+      response.status(401).json({
+        error: {
+          code: 'AUTH_REQUIRED',
+          message: 'Sign in before reading interview learning data.',
+        },
+      });
+      return;
+    }
+    const owner = sessionOwners.get(sessionId);
+    if (subscriptionService.isPersistent && owner !== user.id) {
+      response.status(404).json({
+        error: {
+          code: 'SESSION_NOT_FOUND',
+          message: 'The requested session is not available.',
         },
       });
       return;
@@ -275,7 +587,8 @@ export function createBridgeTalkServer(
     }
 
     response.status(200).json({ sessionId, ...summary });
-  });
+    },
+  );
 
   const server: Server = createServer(app);
   const wss = new WebSocketServer({
@@ -327,8 +640,12 @@ export function createBridgeTalkServer(
     let audioMimeType = 'audio/webm';
     let processingQueue = Promise.resolve();
     let deepgramStream: DeepgramTranscriptionStream | null = null;
+    let isAuthorizingSession = false;
     let isStreamStarting = false;
     let sessionEnding = false;
+    let sessionUserId: string | null = null;
+    let sessionStartedAt: number | null = null;
+    let usageRecorded = false;
     let streamGeneration = 0;
     let pendingAudio: Buffer[] = [];
     let pendingAudioBytes = 0;
@@ -530,6 +847,25 @@ export function createBridgeTalkServer(
       pendingAudioBytes = 0;
     };
 
+    const recordSessionUsage = async (): Promise<void> => {
+      if (usageRecorded || !sessionUserId || sessionStartedAt === null) {
+        return;
+      }
+      usageRecorded = true;
+      try {
+        await subscriptionService.recordConsumedMinutes(
+          sessionUserId,
+          Math.max(1, (Date.now() - sessionStartedAt) / 1000),
+        );
+      } catch {
+        sendJson(webSocket, {
+          type: 'error',
+          code: 'AUDIO_USAGE_RECORD_FAILED',
+          message: 'Audio usage could not be recorded. Please contact support.',
+        });
+      }
+    };
+
     const finishSession = async (): Promise<void> => {
       const activeStream = deepgramStream;
       deepgramStream = null;
@@ -539,8 +875,10 @@ export function createBridgeTalkServer(
       } catch (error: unknown) {
         reportStreamingError(error);
       }
+      await recordSessionUsage();
       sessionActive = false;
       sessionEnding = false;
+      isAuthorizingSession = false;
       isStreamStarting = false;
       streamGeneration += 1;
       clearPendingAudio();
@@ -548,7 +886,7 @@ export function createBridgeTalkServer(
     };
 
     const startSession = (start: SessionStartMessage): void => {
-      if (sessionActive || isStreamStarting) {
+      if (sessionActive || isAuthorizingSession || isStreamStarting) {
         sendJson(webSocket, {
           type: 'error',
           code: 'SESSION_ALREADY_STARTED',
@@ -557,90 +895,171 @@ export function createBridgeTalkServer(
         return;
       }
 
-      sessionId = start.sessionId;
-      sourceLanguage = start.sourceLanguage;
-      targetLanguage = start.targetLanguage;
-      audioMimeType = start.audioMimeType;
-      sessionActive = true;
-      sessionEnding = false;
-      clearPendingAudio();
-      const generation = ++streamGeneration;
-      const activeSessionId = start.sessionId;
-      const activeSourceLanguage = start.sourceLanguage;
-      const activeTargetLanguage = start.targetLanguage;
-      const openTranscriptionStream = pipeline.openTranscriptionStream;
-
-      const sendSessionStarted = (): void => {
-        sendJson(webSocket, {
-          type: 'session.started',
-          sessionId: activeSessionId,
-          sourceLanguage: activeSourceLanguage,
-          targetLanguage: activeTargetLanguage,
-          pipeline: pipelineConfiguration,
-        });
-      };
-
-      if (!openTranscriptionStream) {
-        sendSessionStarted();
-        return;
-      }
-
-      isStreamStarting = true;
+      isAuthorizingSession = true;
       void (async (): Promise<void> => {
         try {
-          const stream = await openTranscriptionStream({
-            audioMimeType: start.audioMimeType,
-            sourceLanguage: activeSourceLanguage,
-            onEvent: (event) =>
-              handleDeepgramEvent(
-                event,
-                generation,
-                activeSessionId,
-                activeSourceLanguage,
-                activeTargetLanguage,
-              ),
-          });
-          if (
-            generation !== streamGeneration ||
-            webSocket.readyState !== WebSocket.OPEN
-          ) {
-            await stream?.close();
+          const user = await subscriptionService.authenticateAudioUser(
+            start.accessToken,
+          );
+          if (!user) {
+            isAuthorizingSession = false;
+            sendJson(webSocket, {
+              type: 'error',
+              code: 'AUTH_REQUIRED',
+              message: 'Sign in before starting an audio session.',
+            });
             return;
           }
 
-          deepgramStream = stream;
-          isStreamStarting = false;
-          const queuedAudio = pendingAudio;
-          clearPendingAudio();
-          for (const audio of queuedAudio) {
-            if (stream) {
-              stream.sendAudio(audio);
-            } else {
-              enqueue(() => processAudio(audio));
-            }
-          }
-          sendSessionStarted();
-          if (sessionEnding) {
-            void finishSession();
-          }
-        } catch (error: unknown) {
-          if (generation !== streamGeneration) {
+          const currentOwner = sessionOwners.get(start.sessionId);
+          if (currentOwner && currentOwner !== user.id) {
+            isAuthorizingSession = false;
+            sendJson(webSocket, {
+              type: 'error',
+              code: 'SESSION_NOT_FOUND',
+              message: 'The requested session is not available.',
+            });
             return;
           }
-          sessionActive = false;
+
+          if (!contextManager.ensureSession(start.sessionId)) {
+            isAuthorizingSession = false;
+            sendJson(webSocket, {
+              type: 'error',
+              code: 'SESSION_LIMIT_REACHED',
+              message: 'A new in-memory session could not be created.',
+            });
+            return;
+          }
+          sessionOwners.set(start.sessionId, user.id);
+          if (!(await subscriptionService.canUseAudioStream(user.id))) {
+            isAuthorizingSession = false;
+            sendJson(webSocket, {
+              type: 'error',
+              code: 'AUDIO_MINUTE_LIMIT_REACHED',
+              message:
+                'Has alcanzado el límite de minutos de tu plan. Actualiza tu suscripción para continuar.',
+            });
+            return;
+          }
+          if (webSocket.readyState !== WebSocket.OPEN) {
+            isAuthorizingSession = false;
+            return;
+          }
+
+          sessionId = start.sessionId;
+          sessionUserId = user.id;
+          sourceLanguage = start.sourceLanguage;
+          targetLanguage = start.targetLanguage;
+          audioMimeType = start.audioMimeType;
+          sessionActive = true;
           sessionEnding = false;
-          isStreamStarting = false;
+          usageRecorded = false;
+          sessionStartedAt = null;
           clearPendingAudio();
-          reportStreamingError(error);
+          const generation = ++streamGeneration;
+          const activeSessionId = start.sessionId;
+          const activeSourceLanguage = start.sourceLanguage;
+          const activeTargetLanguage = start.targetLanguage;
+          const openTranscriptionStream = pipeline.openTranscriptionStream;
+          isAuthorizingSession = false;
+
+          const sendSessionStarted = (): void => {
+            sessionStartedAt = Date.now();
+            sendJson(webSocket, {
+              type: 'session.started',
+              sessionId: activeSessionId,
+              sourceLanguage: activeSourceLanguage,
+              targetLanguage: activeTargetLanguage,
+              pipeline: pipelineConfiguration,
+            });
+          };
+
+          if (!openTranscriptionStream) {
+            sendSessionStarted();
+            return;
+          }
+
+          isStreamStarting = true;
+          try {
+            const stream = await openTranscriptionStream({
+              audioMimeType: start.audioMimeType,
+              sourceLanguage: activeSourceLanguage,
+              onEvent: (event) =>
+                handleDeepgramEvent(
+                  event,
+                  generation,
+                  activeSessionId,
+                  activeSourceLanguage,
+                  activeTargetLanguage,
+                ),
+            });
+            if (
+              generation !== streamGeneration ||
+              webSocket.readyState !== WebSocket.OPEN
+            ) {
+              await stream?.close();
+              return;
+            }
+
+            deepgramStream = stream;
+            isStreamStarting = false;
+            const queuedAudio = pendingAudio;
+            clearPendingAudio();
+            for (const audio of queuedAudio) {
+              if (stream) {
+                stream.sendAudio(audio);
+              } else {
+                enqueue(() => processAudio(audio));
+              }
+            }
+            sendSessionStarted();
+            if (sessionEnding) {
+              void finishSession();
+            }
+          } catch (error: unknown) {
+            if (generation !== streamGeneration) {
+              return;
+            }
+            sessionActive = false;
+            sessionEnding = false;
+            isStreamStarting = false;
+            clearPendingAudio();
+            reportStreamingError(error);
+          }
+        } catch (error: unknown) {
+          isAuthorizingSession = false;
+          sendJson(webSocket, {
+            type: 'error',
+            code: 'SUBSCRIPTION_CHECK_FAILED',
+            message: 'Could not verify your audio plan. Please try again.',
+          });
         }
       })();
     };
 
     webSocket.on('message', (data: RawData, isBinary: boolean) => {
       if (isBinary) {
+        if (isAuthorizingSession) {
+          sendJson(webSocket, {
+            type: 'error',
+            code: 'SESSION_START_PENDING',
+            message: 'Wait for the audio session to be authorized before sending audio.',
+          });
+          webSocket.close(1008, 'Audio session authorization pending');
+          return;
+        }
         const audio = toBuffer(data);
         if (!sessionActive) {
-          broadcastAudio(audio, webSocket);
+          if (subscriptionService.isPersistent) {
+            sendJson(webSocket, {
+              type: 'error',
+              code: 'SESSION_NOT_STARTED',
+              message: 'Authorize an audio session before sending audio.',
+            });
+          } else {
+            broadcastAudio(audio, webSocket);
+          }
           return;
         }
         if (sessionEnding) {
@@ -680,7 +1099,15 @@ export function createBridgeTalkServer(
       try {
         message = JSON.parse(data.toString());
       } catch {
-        broadcastAudio(toBuffer(data), webSocket);
+        if (subscriptionService.isPersistent) {
+          sendJson(webSocket, {
+            type: 'error',
+            code: 'INVALID_MESSAGE',
+            message: 'Send a valid audio session message before streaming.',
+          });
+        } else {
+          broadcastAudio(toBuffer(data), webSocket);
+        }
         return;
       }
 
@@ -688,19 +1115,23 @@ export function createBridgeTalkServer(
         if (sessionEnding) {
           return;
         }
+        if (isAuthorizingSession) {
+          sendJson(webSocket, {
+            type: 'error',
+            code: 'SESSION_START_PENDING',
+            message: 'Wait for the audio session to be authorized before stopping it.',
+          });
+          return;
+        }
         if (isStreamStarting) {
           sessionEnding = true;
           return;
         }
-        if (deepgramStream) {
+        if (sessionActive || deepgramStream) {
           sessionEnding = true;
           void finishSession();
           return;
         }
-        sessionActive = false;
-        sessionEnding = false;
-        streamGeneration += 1;
-        clearPendingAudio();
         sendJson(webSocket, { type: 'session.stopped' });
         return;
       }
@@ -730,24 +1161,21 @@ export function createBridgeTalkServer(
 
       const sessionStart = parseSessionStart(message);
       if (!sessionStart) {
-        if (sessionActive) {
+        if (sessionActive || isAuthorizingSession || isStreamStarting) {
           sendJson(webSocket, {
             type: 'error',
             code: 'INVALID_MESSAGE',
             message: 'Unsupported or invalid audio session message.',
           });
+        } else if (subscriptionService.isPersistent) {
+          sendJson(webSocket, {
+            type: 'error',
+            code: 'INVALID_MESSAGE',
+            message: 'Send a valid audio session message before streaming.',
+          });
         } else {
           broadcastAudio(toBuffer(data), webSocket);
         }
-        return;
-      }
-
-      if (!contextManager.ensureSession(sessionStart.sessionId)) {
-        sendJson(webSocket, {
-          type: 'error',
-          code: 'SESSION_LIMIT_REACHED',
-          message: 'A new in-memory session could not be created.',
-        });
         return;
       }
 
@@ -759,13 +1187,10 @@ export function createBridgeTalkServer(
       sessionActive = false;
       sessionEnding = true;
       streamGeneration += 1;
+      isAuthorizingSession = false;
       isStreamStarting = false;
       clearPendingAudio();
-      const activeStream = deepgramStream;
-      deepgramStream = null;
-      void activeStream?.close().catch(() => {
-        console.error('Deepgram streaming cleanup failed.');
-      });
+      void finishSession();
     });
 
     webSocket.on('error', () => {
