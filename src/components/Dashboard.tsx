@@ -14,10 +14,13 @@ import type {
   AudioConnectionStatus,
   AudioLanguage,
 } from '../services/audioStreamService.js';
+import { VoiceClonePanel } from './VoiceClonePanel.js';
 
 type DashboardMode = 'interview' | 'translation' | 'practice';
 
 interface DashboardProps {
+  userId: string;
+  accessToken: string | null;
   status: AudioConnectionStatus;
   connectionError: string | null;
   onToggleAudio: () => Promise<void>;
@@ -68,6 +71,8 @@ const connectionLabels: Record<AudioConnectionStatus, string> = {
 };
 
 export function Dashboard({
+  userId,
+  accessToken,
   status,
   connectionError,
   onToggleAudio,
@@ -163,6 +168,12 @@ export function Dashboard({
           {connectionError}
         </p>
       )}
+
+      <VoiceClonePanel
+        userId={userId}
+        accessToken={accessToken}
+        language={sourceLanguage}
+      />
 
       <section
         aria-labelledby="context-heading"

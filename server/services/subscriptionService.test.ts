@@ -11,6 +11,8 @@ const starterProfile: SubscriptionProfile = {
   plan: 'free_trial',
   paddle_customer_id: null,
   paddle_subscription_id: null,
+  cartesia_voice_id: null,
+  cartesia_cloned_voice_id: null,
   minutes_used: 0,
   minutes_limit: 15,
 };
@@ -103,5 +105,31 @@ test('allows an activated subscription without email only for its previously lin
   assert.equal(
     (await service.getProfile('user-123'))?.paddle_subscription_id,
     'sub_456',
+  );
+});
+
+test('stores and retrieves a Cartesia voice ID in the in-memory profile', async () => {
+  const service = createSubscriptionService({
+    env: {},
+    initialProfiles: [starterProfile],
+  });
+
+  assert.equal(await service.getCartesiaVoiceId('user-123'), null);
+  await service.saveCartesiaVoiceId('user-123', 'cloned-voice-id');
+
+  assert.equal(
+    await service.getCartesiaVoiceId('user-123'),
+    'cloned-voice-id',
+  );
+  assert.equal(
+    (await service.getProfile('user-123'))?.cartesia_voice_id,
+    'cloned-voice-id',
+  );
+  await service.activateCartesiaVoiceId('user-123', 'male-voice-id');
+
+  assert.equal(await service.getCartesiaVoiceId('user-123'), 'male-voice-id');
+  assert.equal(
+    await service.getClonedCartesiaVoiceId('user-123'),
+    'cloned-voice-id',
   );
 });

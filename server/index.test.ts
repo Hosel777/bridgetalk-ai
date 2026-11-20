@@ -30,6 +30,7 @@ const bridgeTalk = createBridgeTalkServer({
   allowedOrigins: new Set(['http://localhost:5173']),
   contextManager,
   pipeline,
+  env: {},
 });
 let serverUrl: string;
 
@@ -254,16 +255,16 @@ test('forwards interim Deepgram text and translates only final transcripts', {
   timeout: 5_000,
 }, async () => {
   const streamingContextManager = new ContextManager();
-  let emitDeepgramEvent:
-    | ((event: DeepgramTranscriptionEvent) => void)
-    | null = null;
+  const deepgramEventEmitter: {
+    current: ((event: DeepgramTranscriptionEvent) => void) | null;
+  } = { current: null };
   const streamedAudio: Buffer[] = [];
   let transcriptionRequests = 0;
   let translationRequests = 0;
   let resolveAudioForwarded: (() => void) | null = null;
   const streamingPipeline: AiPipeline = {
     openTranscriptionStream: async ({ onEvent }) => {
-      emitDeepgramEvent = onEvent;
+      deepgramEventEmitter.current = onEvent;
       return {
         sendAudio: (audio) => {
           streamedAudio.push(Buffer.from(audio));
@@ -287,6 +288,7 @@ test('forwards interim Deepgram text and translates only final transcripts', {
     allowedOrigins: new Set(['http://localhost:5173']),
     contextManager: streamingContextManager,
     pipeline: streamingPipeline,
+    env: {},
   });
   let socket: WebSocket | null = null;
 
@@ -329,7 +331,7 @@ test('forwards interim Deepgram text and translates only final transcripts', {
     connectedSocket.send(audio);
     await audioForwarded;
     const partialMessagePromise = nextMessage();
-    const emitPartial = emitDeepgramEvent;
+    const emitPartial = deepgramEventEmitter.current;
     assert.ok(emitPartial);
     emitPartial({ type: 'partial', text: 'Estoy diseñando una API' });
     const partialMessage = await partialMessagePromise;
@@ -380,6 +382,8 @@ test('rejects unsigned Paddle events and activates Pro for a matching signed pur
     plan: 'free_trial',
     paddle_customer_id: null,
     paddle_subscription_id: null,
+    cartesia_voice_id: null,
+    cartesia_cloned_voice_id: null,
     minutes_used: 0,
     minutes_limit: 15,
   };
@@ -393,6 +397,7 @@ test('rejects unsigned Paddle events and activates Pro for a matching signed pur
     contextManager: new ContextManager(),
     pipeline,
     subscriptionService,
+    env: {},
     paddleWebhookSecret: secret,
     paddleProPriceId: 'pri_pro',
   });
@@ -515,6 +520,8 @@ test('activates a matching Paddle transaction.completed event', async () => {
         plan: 'free_trial',
         paddle_customer_id: null,
         paddle_subscription_id: null,
+        cartesia_voice_id: null,
+        cartesia_cloned_voice_id: null,
         minutes_used: 0,
         minutes_limit: 15,
       },
@@ -526,6 +533,7 @@ test('activates a matching Paddle transaction.completed event', async () => {
     contextManager: new ContextManager(),
     pipeline,
     subscriptionService,
+    env: {},
     paddleWebhookSecret: secret,
     paddleProPriceId: 'pri_pro',
   });
@@ -608,6 +616,8 @@ test('blocks a user whose audio minutes are exhausted', async () => {
         plan: 'free_trial',
         paddle_customer_id: null,
         paddle_subscription_id: null,
+        cartesia_voice_id: null,
+        cartesia_cloned_voice_id: null,
         minutes_used: 15,
         minutes_limit: 15,
       },
@@ -616,6 +626,7 @@ test('blocks a user whose audio minutes are exhausted', async () => {
   const limitedServer = createBridgeTalkServer({
     allowedOrigins: new Set(['http://localhost:5173']),
     subscriptionService,
+    env: {},
   });
 
   try {
@@ -677,6 +688,8 @@ test('records elapsed audio minutes when a session stops', async () => {
         plan: 'free_trial',
         paddle_customer_id: null,
         paddle_subscription_id: null,
+        cartesia_voice_id: null,
+        cartesia_cloned_voice_id: null,
         minutes_used: 0,
         minutes_limit: 15,
       },
@@ -685,6 +698,7 @@ test('records elapsed audio minutes when a session stops', async () => {
   const usageServer = createBridgeTalkServer({
     allowedOrigins: new Set(['http://localhost:5173']),
     subscriptionService,
+    env: {},
   });
   let socket: WebSocket | null = null;
 
@@ -756,12 +770,17 @@ test('requires a verified Supabase token before processing production audio', as
         : null,
     canUseAudioStream: async () => true,
     getProfile: async () => null,
+    getCartesiaVoiceId: async () => null,
+    getClonedCartesiaVoiceId: async () => null,
+    saveCartesiaVoiceId: async () => undefined,
+    activateCartesiaVoiceId: async () => undefined,
     recordConsumedMinutes: async () => undefined,
     activateProForPaddle: async () => true,
   };
   const authenticatedServer = createBridgeTalkServer({
     allowedOrigins: new Set(['http://localhost:5173']),
     subscriptionService,
+    env: {},
   });
   const sockets: WebSocket[] = [];
 
@@ -838,6 +857,317 @@ test('requires a verified Supabase token before processing production audio', as
           return;
         }
         authenticatedServer.server.close((serverError) => {
+          if (serverError) {
+            reject(serverError);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+  }
+});
+
+test('selects and persists a configured predefined Cartesia voice', async () => {
+  const userId = 'voice-user-1';
+  const subscriptionService = createSubscriptionService({
+    env: {},
+    initialProfiles: [
+      {
+        id: userId,
+        email: 'voice@example.com',
+        plan: 'free_trial',
+        paddle_customer_id: null,
+        paddle_subscription_id: null,
+        cartesia_voice_id: null,
+        cartesia_cloned_voice_id: null,
+        minutes_used: 0,
+        minutes_limit: 15,
+      },
+    ],
+  });
+  const voiceServer = createBridgeTalkServer({
+    allowedOrigins: new Set(),
+    subscriptionService,
+    env: {
+      CARTESIA_VOICE_MALE_ID: 'male-voice-id',
+      CARTESIA_VOICE_FEMALE_ID: 'female-voice-id',
+    },
+  });
+
+  try {
+    await new Promise<void>((resolve) => {
+      voiceServer.server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = voiceServer.server.address();
+    assert.ok(address && typeof address !== 'string');
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/select`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId, voice: 'male' }),
+      },
+    );
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(result, {
+      voiceId: 'male-voice-id',
+      voiceType: 'male',
+      status: 'active',
+    });
+    assert.equal(await subscriptionService.getCartesiaVoiceId(userId), 'male-voice-id');
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      voiceServer.wss.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        voiceServer.server.close((serverError) => {
+          if (serverError) {
+            reject(serverError);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+  }
+});
+
+test('persists the voice ID returned by Cartesia when cloning is configured', async () => {
+  const userId = 'cartesia-voice-user';
+  const subscriptionService = createSubscriptionService({ env: {} });
+  let receivedAudio: Buffer | null = null;
+  const clonePipeline: AiPipeline = {
+    ...pipeline,
+    cloneVoice: async (audio, _mimeType, _name, _language) => {
+      receivedAudio = audio;
+      return 'provider-cloned-voice-id';
+    },
+  };
+  const voiceServer = createBridgeTalkServer({
+    allowedOrigins: new Set(),
+    pipeline: clonePipeline,
+    subscriptionService,
+    env: { CARTESIA_API_KEY: 'test-cartesia-key' },
+  });
+
+  try {
+    await new Promise<void>((resolve) => {
+      voiceServer.server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = voiceServer.server.address();
+    assert.ok(address && typeof address !== 'string');
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/clone?userId=${encodeURIComponent(userId)}&language=es`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'audio/webm' },
+        body: Buffer.from([1, 2, 3]),
+      },
+    );
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(result, {
+      voiceId: 'provider-cloned-voice-id',
+      voiceType: 'cloned',
+      status: 'active',
+    });
+    assert.deepEqual(receivedAudio, Buffer.from([1, 2, 3]));
+    assert.equal(
+      await subscriptionService.getCartesiaVoiceId(userId),
+      'provider-cloned-voice-id',
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      voiceServer.wss.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        voiceServer.server.close((serverError) => {
+          if (serverError) {
+            reject(serverError);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+  }
+});
+
+test('creates and persists a sandbox Cartesia voice ID without an API key', async () => {
+  const userId = 'sandbox-voice-user';
+  const subscriptionService = createSubscriptionService({ env: {} });
+  const voiceServer = createBridgeTalkServer({
+    allowedOrigins: new Set(),
+    subscriptionService,
+    env: {
+      CARTESIA_VOICE_MALE_ID: 'male-voice-id',
+      CARTESIA_VOICE_FEMALE_ID: 'female-voice-id',
+    },
+  });
+
+  try {
+    await new Promise<void>((resolve) => {
+      voiceServer.server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = voiceServer.server.address();
+    assert.ok(address && typeof address !== 'string');
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/clone?userId=${encodeURIComponent(userId)}&language=es`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'audio/webm' },
+        body: Buffer.from([1, 2, 3]),
+      },
+    );
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(result.voiceType, 'cloned');
+    assert.equal(result.status, 'sandbox');
+    assert.match(result.voiceId, /^sandbox-[0-9a-f-]{36}$/);
+    assert.equal(await subscriptionService.getCartesiaVoiceId(userId), result.voiceId);
+    assert.equal(
+      await subscriptionService.getClonedCartesiaVoiceId(userId),
+      result.voiceId,
+    );
+    const savedVoiceResponse = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice?userId=${encodeURIComponent(userId)}`,
+    );
+    const savedVoice = await savedVoiceResponse.json();
+    assert.equal(savedVoiceResponse.status, 200);
+    assert.equal(savedVoice.voiceId, result.voiceId);
+    assert.equal(savedVoice.voiceType, 'cloned');
+    assert.equal(savedVoice.hasClonedVoice, true);
+
+    const maleSelection = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/select`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId, voice: 'male' }),
+      },
+    );
+    assert.equal(maleSelection.status, 200);
+    assert.equal(await subscriptionService.getCartesiaVoiceId(userId), 'male-voice-id');
+
+    const femaleSelection = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/select`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId, voice: 'female' }),
+      },
+    );
+    const selectedFemale = await femaleSelection.json();
+    assert.equal(femaleSelection.status, 200);
+    assert.equal(selectedFemale.voiceId, 'female-voice-id');
+    assert.equal(selectedFemale.voiceType, 'female');
+    assert.equal(await subscriptionService.getCartesiaVoiceId(userId), 'female-voice-id');
+
+    const clonedSelection = await fetch(
+      `http://127.0.0.1:${address.port}/api/voice/select`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId, voice: 'cloned' }),
+      },
+    );
+    const restoredClone = await clonedSelection.json();
+    assert.equal(clonedSelection.status, 200);
+    assert.equal(restoredClone.voiceId, result.voiceId);
+    assert.equal(await subscriptionService.getCartesiaVoiceId(userId), result.voiceId);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      voiceServer.wss.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        voiceServer.server.close((serverError) => {
+          if (serverError) {
+            reject(serverError);
+            return;
+          }
+          resolve();
+        });
+      });
+    });
+  }
+});
+
+test('requires authentication and prevents selecting a voice for another account', async () => {
+  const authenticatedUserId = '55555555-5555-4555-8555-555555555555';
+  let selectedVoiceId: string | null = null;
+  const subscriptionService: SubscriptionService = {
+    isPersistent: true,
+    authenticateAudioUser: async (accessToken) =>
+      accessToken === 'verified-access-token'
+        ? { id: authenticatedUserId, email: 'user@example.com' }
+        : null,
+    canUseAudioStream: async () => true,
+    getProfile: async () => null,
+    getCartesiaVoiceId: async () => selectedVoiceId,
+    getClonedCartesiaVoiceId: async () => null,
+    saveCartesiaVoiceId: async () => undefined,
+    activateCartesiaVoiceId: async (_userId, voiceId) => {
+      selectedVoiceId = voiceId;
+    },
+    recordConsumedMinutes: async () => undefined,
+    activateProForPaddle: async () => true,
+  };
+  const voiceServer = createBridgeTalkServer({
+    allowedOrigins: new Set(),
+    subscriptionService,
+    env: { CARTESIA_VOICE_MALE_ID: 'male-voice-id' },
+  });
+
+  try {
+    await new Promise<void>((resolve) => {
+      voiceServer.server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = voiceServer.server.address();
+    assert.ok(address && typeof address !== 'string');
+    const endpoint = `http://127.0.0.1:${address.port}/api/voice/select`;
+    const body = JSON.stringify({
+      userId: authenticatedUserId,
+      voice: 'male',
+    });
+    const unauthorized = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+    const mismatched = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer verified-access-token',
+      },
+      body: JSON.stringify({ userId: 'other-user', voice: 'male' }),
+    });
+
+    assert.equal(unauthorized.status, 401);
+    assert.equal(mismatched.status, 403);
+    assert.equal(selectedVoiceId, null);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      voiceServer.wss.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        voiceServer.server.close((serverError) => {
           if (serverError) {
             reject(serverError);
             return;

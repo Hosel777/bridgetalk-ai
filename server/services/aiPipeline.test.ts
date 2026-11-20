@@ -184,6 +184,60 @@ test('synthesizes Cartesia audio as a binary response', async () => {
   assert.equal(requestUrl, 'https://api.cartesia.ai/tts/bytes');
   assert.equal(requestBody?.language, 'en');
   assert.equal(requestBody?.transcript, 'Hello, recruiter.');
+  assert.deepEqual(requestBody?.voice, { id: 'voice-id' });
+});
+
+test('uses a session-specific Cartesia voice ID instead of the configured default', async () => {
+  let requestBody: Record<string, unknown> | null = null;
+  const pipeline = createAiPipeline({
+    env: {
+      CARTESIA_API_KEY: 'test-cartesia-key',
+      CARTESIA_VOICE_ID: 'default-voice-id',
+    },
+    fetcher: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(Uint8Array.from([1]));
+    },
+  });
+
+  await pipeline.synthesizeSpeech('Hello.', 'en', 'session-voice-id');
+
+  assert.deepEqual(requestBody?.voice, { id: 'session-voice-id' });
+});
+
+test('clones a Cartesia voice using multipart audio and returns its voice ID', async () => {
+  let requestUrl = '';
+  let requestInit: RequestInit | undefined;
+  const pipeline = createAiPipeline({
+    env: { CARTESIA_API_KEY: 'test-cartesia-key' },
+    fetcher: async (input, init) => {
+      requestUrl = String(input);
+      requestInit = init;
+      return new Response(JSON.stringify({ id: 'cloned-voice-id' }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+
+  const voiceId = await pipeline.cloneVoice(
+    Buffer.from([1, 2, 3]),
+    'audio/webm',
+    'BridgeTalk test voice',
+    'es',
+  );
+
+  assert.equal(voiceId, 'cloned-voice-id');
+  assert.equal(requestUrl, 'https://api.cartesia.ai/voices/clone');
+  assert.equal(requestInit?.method, 'POST');
+  assert.equal(new Headers(requestInit?.headers).get('authorization'), 'Bearer test-cartesia-key');
+  assert.ok(requestInit?.body instanceof FormData);
+  const formData = requestInit.body;
+  assert.equal(formData.get('name'), 'BridgeTalk test voice');
+  assert.equal(formData.get('language'), 'es');
+  const clip = formData.get('clip');
+  assert.ok(clip instanceof Blob);
+  assert.equal(clip.type, 'audio/webm');
+  assert.deepEqual(Buffer.from(await clip.arrayBuffer()), Buffer.from([1, 2, 3]));
 });
 
 test('streams Deepgram partial and final transcripts over one persistent session', {

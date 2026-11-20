@@ -51,7 +51,14 @@ export interface AiPipeline {
   synthesizeSpeech(
     text: string,
     targetLanguage: SessionLanguage,
+    voiceId?: string,
   ): Promise<Buffer>;
+  cloneVoice?(
+    audio: Buffer,
+    audioMimeType: string,
+    name: string,
+    language: SessionLanguage,
+  ): Promise<string>;
   generateConfidenceSeal(
     context: InterviewContext,
     targetLanguage: SessionLanguage,
@@ -594,13 +601,17 @@ export function createAiPipeline(
       );
     },
 
-    async synthesizeSpeech(text, targetLanguage): Promise<Buffer> {
+    async synthesizeSpeech(
+      text,
+      targetLanguage,
+      sessionVoiceId,
+    ): Promise<Buffer> {
       const apiKey = env.CARTESIA_API_KEY?.trim();
-      const voiceId = env.CARTESIA_VOICE_ID?.trim();
+      const voiceId = sessionVoiceId?.trim() || env.CARTESIA_VOICE_ID?.trim();
       if (!apiKey || !voiceId) {
         throw new AiPipelineError(
           'CARTESIA_NOT_CONFIGURED',
-          'Cartesia requires CARTESIA_API_KEY and CARTESIA_VOICE_ID on the server.',
+          'Cartesia requires CARTESIA_API_KEY and a configured voice ID on the server.',
         );
       }
       if (env.TTS_PROVIDER && env.TTS_PROVIDER !== 'cartesia') {
@@ -650,6 +661,86 @@ export function createAiPipeline(
         );
       }
       return audio;
+    },
+
+    async cloneVoice(audio, audioMimeType, name, language): Promise<string> {
+      const apiKey = env.CARTESIA_API_KEY?.trim();
+      if (!apiKey) {
+        throw new AiPipelineError(
+          'CARTESIA_NOT_CONFIGURED',
+          'Cartesia voice cloning requires CARTESIA_API_KEY on the server.',
+        );
+      }
+
+      const contentType = audioMimeType
+        .split(';', 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (
+        !contentType ||
+        ![
+          'audio/flac',
+          'audio/mpeg',
+          'audio/mpga',
+          'audio/ogg',
+          'audio/oga',
+          'audio/wav',
+          'audio/webm',
+        ].includes(contentType)
+      ) {
+        throw new AiPipelineError(
+          'INVALID_AUDIO_TYPE',
+          'Cartesia voice cloning requires a supported audio format.',
+        );
+      }
+
+      const formData = new FormData();
+      formData.append(
+        'clip',
+        new Blob([Uint8Array.from(audio)], { type: contentType }),
+        `voice.${contentType.split('/')[1]}`,
+      );
+      formData.append('name', name);
+      formData.append('language', language);
+      formData.append('access', 'private');
+
+      const response = await fetchProvider(
+        fetcher,
+        'CARTESIA_UNAVAILABLE',
+        'The Cartesia voice-cloning request failed or timed out.',
+        'https://api.cartesia.ai/voices/clone',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Cartesia-Version': env.CARTESIA_VERSION?.trim() || CARTESIA_API_VERSION,
+          },
+          body: formData,
+        },
+      );
+      if (!response.ok) {
+        throw new AiPipelineError(
+          'CARTESIA_REQUEST_REJECTED',
+          'Cartesia rejected the voice-cloning request.',
+        );
+      }
+
+      const result = await readJsonResponse(
+        response,
+        'CARTESIA_INVALID_RESPONSE',
+        'Cartesia returned an invalid voice-cloning response.',
+      );
+      if (
+        typeof result.id !== 'string' ||
+        !result.id.trim() ||
+        result.id.length > 256
+      ) {
+        throw new AiPipelineError(
+          'CARTESIA_INVALID_RESPONSE',
+          'Cartesia returned an invalid voice ID.',
+        );
+      }
+      return result.id.trim();
     },
 
     async generateConfidenceSeal(

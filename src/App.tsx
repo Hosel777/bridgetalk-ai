@@ -593,6 +593,8 @@ export default function App(): React.JSX.Element {
           </div>
         )}
         <Dashboard
+          userId={authSession?.user.id ?? 'demo-local'}
+          accessToken={authSession?.access_token ?? null}
           status={status}
           connectionError={connectionError}
           onToggleAudio={toggleAudio}

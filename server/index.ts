@@ -22,6 +22,7 @@ import {
   createSubscriptionService,
   type SubscriptionService,
 } from './services/subscriptionService.js';
+import { registerVoiceRoutes } from './voiceRoutes.js';
 
 export const PORT = Number(process.env.PORT ?? 3001);
 const MAX_AUDIO_PAYLOAD_BYTES = 1024 * 1024;
@@ -64,6 +65,7 @@ interface ServerOptions {
   contextManager?: ContextManager;
   pipeline?: AiPipeline;
   subscriptionService?: SubscriptionService;
+  env?: NodeJS.ProcessEnv;
   paddleWebhookSecret?: string;
   paddleProPriceId?: string;
 }
@@ -278,6 +280,7 @@ function getPipelineConfiguration(pipelineEnv: NodeJS.ProcessEnv): {
 export function createBridgeTalkServer(
   options: ServerOptions = {},
 ): BridgeTalkServer {
+  const env = options.env ?? process.env;
   const app: Express = express();
   app.disable('x-powered-by');
   app.get('/healthz', (_request, response) => {
@@ -285,20 +288,21 @@ export function createBridgeTalkServer(
   });
 
   const contextManager = options.contextManager ?? new ContextManager();
-  const pipeline = options.pipeline ?? createAiPipeline();
+  const pipeline = options.pipeline ?? createAiPipeline({ env });
   const subscriptionService =
-    options.subscriptionService ?? createSubscriptionService();
+    options.subscriptionService ?? createSubscriptionService({ env });
   const paddleWebhookSecret = (
-    options.paddleWebhookSecret ?? process.env.PADDLE_WEBHOOK_SECRET ?? ''
+    options.paddleWebhookSecret ?? env.PADDLE_WEBHOOK_SECRET ?? ''
   ).trim();
   const paddleProPriceId = (
     options.paddleProPriceId ??
-    process.env.PADDLE_PRO_PRICE_ID ??
-    process.env.VITE_PADDLE_PRICE_ID ??
+    env.PADDLE_PRO_PRICE_ID ??
+    env.VITE_PADDLE_PRICE_ID ??
     ''
   ).trim();
   const sessionOwners = new Map<string, string>();
   const jsonParser = express.json({ limit: '100kb' });
+  registerVoiceRoutes(app, { env, pipeline, subscriptionService });
 
   app.post(
     '/api/webhooks/paddle',
@@ -604,7 +608,7 @@ export function createBridgeTalkServer(
     }
   };
   const allowedOrigins = options.allowedOrigins ?? getAllowedOrigins();
-  const pipelineConfiguration = getPipelineConfiguration(process.env);
+  const pipelineConfiguration = getPipelineConfiguration(env);
 
   server.on('upgrade', (request, socket, head) => {
     let url: URL;
@@ -644,6 +648,7 @@ export function createBridgeTalkServer(
     let isStreamStarting = false;
     let sessionEnding = false;
     let sessionUserId: string | null = null;
+    let sessionVoiceId: string | null = null;
     let sessionStartedAt: number | null = null;
     let usageRecorded = false;
     let streamGeneration = 0;
@@ -705,6 +710,7 @@ export function createBridgeTalkServer(
       const audioOutput = await pipeline.synthesizeSpeech(
         translatedText,
         activeTargetLanguage,
+        sessionVoiceId ?? undefined,
       );
 
       sendJson(webSocket, {
@@ -773,6 +779,7 @@ export function createBridgeTalkServer(
       const audioOutput = await pipeline.synthesizeSpeech(
         translatedText,
         targetLanguage,
+        sessionVoiceId ?? undefined,
       );
       sendJson(webSocket, {
         type: 'confidence.result',
@@ -942,6 +949,8 @@ export function createBridgeTalkServer(
             });
             return;
           }
+          const activeVoiceId =
+            await subscriptionService.getCartesiaVoiceId(user.id);
           if (webSocket.readyState !== WebSocket.OPEN) {
             isAuthorizingSession = false;
             return;
@@ -949,6 +958,7 @@ export function createBridgeTalkServer(
 
           sessionId = start.sessionId;
           sessionUserId = user.id;
+          sessionVoiceId = activeVoiceId;
           sourceLanguage = start.sourceLanguage;
           targetLanguage = start.targetLanguage;
           audioMimeType = start.audioMimeType;

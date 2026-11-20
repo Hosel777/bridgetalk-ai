@@ -5,10 +5,17 @@ create table if not exists public.user_profiles (
     check (plan in ('free_trial', 'pro')),
   paddle_customer_id text,
   paddle_subscription_id text,
+  cartesia_voice_id text,
+  cartesia_cloned_voice_id text,
   minutes_used integer not null default 0 check (minutes_used >= 0),
   minutes_limit integer not null default 15 check (minutes_limit >= 0),
   updated_at timestamptz not null default now()
 );
+
+alter table public.user_profiles
+  add column if not exists cartesia_voice_id text;
+alter table public.user_profiles
+  add column if not exists cartesia_cloned_voice_id text;
 
 create table if not exists public.learning_progress (
   id uuid primary key default gen_random_uuid(),
