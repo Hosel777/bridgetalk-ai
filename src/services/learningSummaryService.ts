@@ -1,3 +1,5 @@
+import { getBackendUrl } from './backendUrl.js';
+
 export interface LearningVocabularyGap {
   id: string;
   originalSpanish: string;
@@ -67,7 +69,9 @@ export async function fetchLearningSummary(
   accessToken?: string | null,
 ): Promise<LearningSummary> {
   const response = await fetch(
-    `/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+    getBackendUrl(
+      `/api/learning-summary?sessionId=${encodeURIComponent(sessionId)}`,
+    ),
     {
       ...(accessToken
         ? { headers: { Authorization: `Bearer ${accessToken}` } }

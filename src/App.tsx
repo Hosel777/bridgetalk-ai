@@ -14,6 +14,7 @@ import {
   type AudioLanguage,
   type TranscriptEvent,
 } from './services/audioStreamService.js';
+import { getBackendUrl } from './services/backendUrl.js';
 import {
   fetchLearningSummary,
   type LearningSummary,
@@ -472,7 +473,7 @@ export default function App(): React.JSX.Element {
     setConnectionError(null);
     setIsSavingContext(true);
     try {
-      const response = await fetch('/api/context', {
+      const response = await fetch(getBackendUrl('/api/context'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

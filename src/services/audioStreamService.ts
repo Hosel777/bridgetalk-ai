@@ -1,3 +1,5 @@
+import { getBackendBaseUrl } from './backendUrl.js';
+
 export type AudioConnectionStatus =
   | 'disconnected'
   | 'connecting'
@@ -56,35 +58,17 @@ export interface AudioStreamOptions {
 
 export function getAudioWebSocketUrl(
   backendUrl: string | undefined = import.meta.env?.VITE_BACKEND_URL,
-  currentLocation?: Pick<Location, 'protocol' | 'host'>,
+  isDevelopment = import.meta.env?.DEV === true,
 ): string {
-  const configuredBackendUrl = backendUrl?.trim();
-  if (configuredBackendUrl) {
-    let parsedBackendUrl: URL;
-    try {
-      parsedBackendUrl = new URL(configuredBackendUrl);
-    } catch {
-      throw new Error('VITE_BACKEND_URL must be a valid URL.');
-    }
-
-    if (
-      parsedBackendUrl.protocol !== 'http:' &&
-      parsedBackendUrl.protocol !== 'https:'
-    ) {
-      throw new Error('VITE_BACKEND_URL must use http:// or https://.');
-    }
-
-    parsedBackendUrl.protocol =
-      parsedBackendUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-    parsedBackendUrl.pathname = '/audio';
-    parsedBackendUrl.search = '';
-    parsedBackendUrl.hash = '';
-    return parsedBackendUrl.toString();
-  }
-
-  const location = currentLocation ?? window.location;
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${location.host}/audio`;
+  const parsedBackendUrl = new URL(
+    getBackendBaseUrl(backendUrl, isDevelopment),
+  );
+  parsedBackendUrl.protocol =
+    parsedBackendUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  parsedBackendUrl.pathname = '/audio';
+  parsedBackendUrl.search = '';
+  parsedBackendUrl.hash = '';
+  return parsedBackendUrl.toString();
 }
 
 export const VOICE_ACTIVITY_RMS_THRESHOLD = 0.025;

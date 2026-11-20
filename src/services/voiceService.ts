@@ -1,3 +1,5 @@
+import { getBackendUrl } from './backendUrl.js';
+
 export type VoiceChoice = 'male' | 'female' | 'cloned';
 
 export interface VoiceProfile {
@@ -49,7 +51,7 @@ export async function getVoiceProfile(
   accessToken: string | null,
 ): Promise<VoiceProfile> {
   const query = new URLSearchParams({ userId });
-  const response = await fetch(`/api/voice?${query}`, {
+  const response = await fetch(getBackendUrl(`/api/voice?${query}`), {
     headers: authorizationHeaders(accessToken),
   });
   const payload = await readJsonResponse(response);
@@ -79,7 +81,7 @@ export async function selectVoice(
   accessToken: string | null,
   voice: VoiceChoice,
 ): Promise<VoiceChangeResult> {
-  const response = await fetch('/api/voice/select', {
+  const response = await fetch(getBackendUrl('/api/voice/select'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -101,7 +103,7 @@ export async function cloneVoice(
   audio: Blob,
 ): Promise<VoiceChangeResult> {
   const query = new URLSearchParams({ userId, language });
-  const response = await fetch(`/api/voice/clone?${query}`, {
+  const response = await fetch(getBackendUrl(`/api/voice/clone?${query}`), {
     method: 'POST',
     headers: {
       'Content-Type': audio.type,

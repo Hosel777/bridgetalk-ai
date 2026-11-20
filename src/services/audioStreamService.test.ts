@@ -1,10 +1,26 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { getBackendBaseUrl, getBackendUrl } from './backendUrl.js';
 import {
   getAudioWebSocketUrl,
   hasVoiceActivity,
   shouldSendAudioChunk,
 } from './audioStreamService.js';
+
+test('normalizes trailing slashes when building backend URLs', () => {
+  assert.equal(
+    getBackendUrl('/api/voice?userId=123', 'https://api.example.com///'),
+    'https://api.example.com/api/voice?userId=123',
+  );
+});
+
+test('uses the local backend fallback only in development', () => {
+  assert.equal(getBackendBaseUrl('', true), 'http://localhost:3001');
+  assert.throws(
+    () => getBackendBaseUrl('', false),
+    /VITE_BACKEND_URL must be configured/,
+  );
+});
 
 test('uses a configured HTTPS backend as a secure audio WebSocket', () => {
   assert.equal(
@@ -13,13 +29,10 @@ test('uses a configured HTTPS backend as a secure audio WebSocket', () => {
   );
 });
 
-test('falls back to the current browser host when no backend is configured', () => {
+test('uses the local backend for audio WebSockets in development', () => {
   assert.equal(
-    getAudioWebSocketUrl('', {
-      protocol: 'https:',
-      host: 'app.example.com',
-    }),
-    'wss://app.example.com/audio',
+    getAudioWebSocketUrl('', true),
+    'ws://localhost:3001/audio',
   );
 });
 
